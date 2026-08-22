@@ -42,7 +42,7 @@ unsloth/Llama-3.2-1B  (base — no instruction tuning)
 
 **While the repo is private**, a Colab runtime carries no GitHub credentials, so the notebooks
 cannot `git clone` it. They fall back to looking for the repo in Google Drive at
-`MyDrive/fine_tuning`. Either upload the repo folder there once, or make the repo public and the
+`MyDrive`. Either upload the repo folder there once (any folder name works), or make the repo public and the
 clone path works with no further setup.
 
 ---
