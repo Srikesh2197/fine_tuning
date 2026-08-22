@@ -22,3 +22,11 @@ accelerate==1.14.0
 # peft==0.17.1
 # datasets==4.0.0
 # accelerate==1.10.1
+
+# --- Colab's preinstalled torchao ------------------------------------------
+# Colab ships torchao 0.10.x. peft's optional torchao integration RAISES an
+# ImportError rather than degrading when it finds a version below its 0.16.0
+# minimum, and the check fires inside get_peft_model(). Nothing in this repo
+# uses torchao, so both notebooks uninstall it:
+#
+#     %pip uninstall -q -y torchao
