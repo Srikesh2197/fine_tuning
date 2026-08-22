@@ -27,18 +27,23 @@ unsloth/Llama-3.2-1B  (base — no instruction tuning)
 
 ## Quick start
 
-1. Push this repo to your own GitHub account.
-2. Open notebook 01 in Colab, set the runtime to **T4 GPU**, and set `REPO_URL` in cell 2.
-3. Run it top to bottom (~10 min). It saves a LoRA adapter to your Drive.
-4. Open notebook 02 and run it top to bottom (~10 min). It picks the adapter up from Drive.
+1. Open notebook 01 in Colab (badge below) and set the runtime to **T4 GPU**
+   (Runtime -> Change runtime type -> T4 GPU).
+2. Run it top to bottom (~10 min). It saves a LoRA adapter to your Google Drive.
+3. Open notebook 02 and run it top to bottom (~10 min). It picks the adapter up from Drive.
 
 | | |
 |---|---|
-| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR-USERNAME/Fine_tuning_demo/blob/main/notebooks/01_domain_adaptation_lora.ipynb) | **01 — Domain adaptation** (non-instructional, LoRA) |
-| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR-USERNAME/Fine_tuning_demo/blob/main/notebooks/02_instruction_finetuning_lora.ipynb) | **02 — Instruction tuning** (LoRA on the merged stage-1 model) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/feature_base/notebooks/01_domain_adaptation_lora.ipynb) | **01 - Domain adaptation** (non-instructional, LoRA) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/feature_base/notebooks/02_instruction_finetuning_lora.ipynb) | **02 - Instruction tuning** (LoRA on the merged stage-1 model) |
 
-> Replace `YOUR-USERNAME` in the badge URLs and in each notebook's `REPO_URL`.
-> The notebooks ship **without outputs** — run them yourself, the numbers are the point.
+> Badges point at `feature_base`, since `main` is intentionally empty.
+> The notebooks ship **without outputs** - run them yourself, the numbers are the point.
+
+**While the repo is private**, a Colab runtime carries no GitHub credentials, so the notebooks
+cannot `git clone` it. They fall back to looking for the repo in Google Drive at
+`MyDrive/fine_tuning`. Either upload the repo folder there once, or make the repo public and the
+clone path works with no further setup.
 
 ---
 
