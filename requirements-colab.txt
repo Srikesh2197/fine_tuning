@@ -1,0 +1,24 @@
+# Pinned for Google Colab (free-tier T4). Both notebooks install from this file.
+#
+# torch is deliberately NOT pinned: Colab ships a CUDA-matched build, and
+# reinstalling it there is slow and frequently breaks the runtime.
+# transformers 5.x requires torch>=2.5 and Python>=3.10 — Colab satisfies both.
+#
+# TRL is deliberately absent. The training loops here use plain
+# transformers.Trainer + peft so the mechanics stay visible, and so the repo is
+# insulated from TRL's ongoing SFTConfig / max_seq_length API churn.
+
+transformers==5.15.0
+peft==0.20.0
+datasets==5.0.1
+accelerate==1.14.0
+
+# --- Fallback pin set -------------------------------------------------------
+# If the pins above ever conflict with Colab's preinstalled torch, this older
+# combination is known-good. You must then swap `dtype=` for `torch_dtype=` in
+# the model-loading cells (transformers renamed it in v5).
+#
+# transformers==4.56.2
+# peft==0.17.1
+# datasets==4.0.0
+# accelerate==1.10.1

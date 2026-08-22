@@ -1,0 +1,24 @@
+# Training artifacts — regenerate these by running the notebooks
+outputs/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.gguf
+wandb/
+runs/
+
+# Archives
+*.zip
+*.tar.gz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
