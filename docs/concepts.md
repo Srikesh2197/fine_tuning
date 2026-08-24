@@ -91,8 +91,9 @@ The `["q_proj", "v_proj"]` default comes from the original LoRA paper, which stu
 *behavioural* adaptation. It is a poor default for domain adaptation.
 
 Attention decides **what to look at**; the feed-forward layers are where **factual and lexical
-association** is stored. If you want the model to absorb a vocabulary — `Halton tier`, `Gatepost`,
-`DXI` — the MLP is where that lands. Both notebooks target all seven projections.
+association** is stored. If you want the model to absorb a vocabulary — `hepatic gluconeogenesis`,
+`odds ratio`, `intention-to-treat` — the MLP is where that lands. Both notebooks target all seven
+projections.
 
 If domain adaptation underdelivers, check `target_modules` before touching `r`.
 
@@ -142,7 +143,8 @@ tokens["labels"] = tokens["input_ids"].copy()      # ← the bug
 
 Two things go wrong:
 
-1. Most of each sequence is padding. In this repo's corpus, ~84% of token slots.
+1. Most of each sequence is padding. On this repo's PubMed corpus, ~81% of token slots — abstract
+   sections have a median of 80 tokens against a 512-token window.
 2. Because labels are a straight copy, **pad positions are supervised**. The model is explicitly
    trained to predict `<pad>` after `<pad>`.
 
@@ -169,18 +171,32 @@ The single highest-leverage detail in instruction tuning.
 A training example renders as:
 
 ```
-Below is an instruction describing a task. Write a response that appropriately completes the request.
+Below is an instruction describing a task, paired with input providing further context.
+Write a response that appropriately completes the request.
 
 ### Instruction:
-How often must an H1 model be revalidated?
+Answer the research question using only the abstract provided. Begin your reply with
+"Answer:" followed by yes, no, or maybe, then justify it in one or two sentences.
+
+Question: Do mitochondria play a role in remodelling lace plant leaves during PCD?
+
+### Input:
+BACKGROUND: Programmed cell death (PCD) is the regulated death of cells within an organism...
+RESULTS: The following paper elucidates the role of mitochondria during PCD...
 
 ### Response:
-Every six months. That interval is a ceiling rather than a target...<|end_of_text|>
+Answer: yes
+
+Results depicted mitochondrial dynamics in vivo as PCD progresses...<|end_of_text|>
 ```
 
-If you supervise the whole sequence, you are training the model to generate **the boilerplate and
-the question** as readily as the answer. It learns that a plausible thing to emit is
-`### Instruction:` followed by a question it invents. This is a real, observed failure mode.
+If you supervise the whole sequence, you are training the model to generate **the boilerplate, the
+question, and the entire abstract** as readily as the answer. It learns that a plausible thing to
+emit is `### Instruction:` followed by a question it invents. This is a real, observed failure mode.
+
+On this dataset the arithmetic is brutal: the abstract is most of the sequence, so **only 12% of
+tokens are response**. Without the mask, 88% of the training budget goes on regurgitating text the
+model is only supposed to read.
 
 Set `labels = -100` across the prompt span:
 
@@ -304,16 +320,35 @@ Notebook 01 measures perplexity on out-of-domain text with the adapter on and of
 is the normal cost of specialising; a large jump means your learning rate or epoch count is too
 aggressive.
 
-### Memorization probes
+### Memorization, not memorization probes
 
-Because the corpus describes a **fictional** institution, its vocabulary is provably absent from
-pretraining. If the adapted model completes "an H1 model must be revalidated every" with "six
-months", that string cannot have come from anywhere but our training data.
+The earlier version of this repo trained on an invented corpus, which let it plant facts the base
+model provably could not know. That is a neat trick and it is also a crutch: it proves the weights
+moved, not that anything useful happened.
 
-This is a far crisper signal than a perplexity delta of a few tenths, and it's why the corpus was
-built around invented terminology in the first place.
+With real data you need the honest versions instead:
 
----
+- **Stage 1** measures perplexity on held-out abstracts, plus an out-of-domain control, plus an
+  n-gram overlap check against the true continuation of a *training* abstract. That last one is
+  the memorization test proper: a model reproducing training text verbatim has stopped
+  generalising. Low single-digit overlap is healthy; above ~30% means cut the epochs.
+- **Stage 2** has a real metric — decision accuracy on held-out articles, against a 55%
+  majority-class baseline. That is the number that matters, and unlike a perplexity delta it
+  cannot be satisfied by the model simply becoming more fluent.
+
+### Report the baseline you can actually lose to
+
+Three baselines are worth carrying in any classification-flavoured fine-tune:
+
+| baseline | what it rules out |
+|---|---|
+| **Majority class** | A model that learned the label prior and nothing else |
+| **Untuned base model** | That the training did anything at all |
+| **Base model + prompting** | That the training did something prompting couldn't |
+
+The first is free and the most frequently omitted. On PubMedQA's 55/34/11 label split, a model
+that answers "yes" to everything scores 55%, which looks respectable in isolation. Notebook 02
+prints a confusion matrix precisely so that outcome is visible rather than flattering.
 
 ## 10. When *not* to fine-tune
 
@@ -396,32 +431,63 @@ that fails loudly.
 
 ---
 
-## 12. Synthetic instruction data
+## 12. Choosing a dataset for two-stage fine-tuning
 
-This repo generates instruction data by **hand-authoring seeds and expanding programmatically**
-(`scripts/generate_instructions.py`). The seeds are grounded in the corpus; the expansion applies
-request-form decorators, plus classification tasks derived from document structure.
+The hardest practical constraint in this repo was not the code — it was finding **one authentic
+source that feeds both stages**. Stage 1 needs raw text; stage 2 needs instruction pairs. Most
+public datasets give you one or the other, and stitching two unrelated ones together means stage 1
+adapts to a domain stage 2 never asks about.
 
-That is the self-instruct pattern with the LLM step replaced by templating: reproducible, free,
-offline — and the paraphrases are mechanical rather than natural.
+What to look for, in rough priority order:
 
-**What an LLM-driven expansion would add**, and what it needs care with:
+**1. Is the raw text actually out of the base model's comfort zone?**
+This is the criterion people skip, and it silently ruins the demo. SQuAD contexts, Dolly contexts,
+and most "clean" corpora are Wikipedia — which every base model has already seen many times.
+Domain-adapting on them moves perplexity by almost nothing, and you conclude your pipeline is
+broken when it is working perfectly on data with no headroom. Specialised registers work:
+biomedical abstracts, legal opinions, patents, clinical notes, code in a niche language.
 
-| Gain | Care |
-|---|---|
-| Natural, varied phrasings | Costs money; output varies between runs |
-| Much larger sets from the same seeds | Must dedup against seeds and against itself — near-duplicates inflate apparent size |
-| Harder, more diverse task types | Check the licence: some model terms prohibit training on their outputs |
-| Answers you didn't have to write | Generated answers need verification against source, or you're training on the generator's errors |
+**2. Does stage 2 have a gradable target?**
+Free-text instruction data leaves you comparing generations by eye, which is unfalsifiable. A
+label — a class, a number, a span — gives you accuracy against a baseline. PubMedQA's
+`final_decision` is why notebook 02 has a real metric instead of a vibes table.
 
-### Include abstention examples
+**3. Are the stages disjoint?**
+If stage 1's raw text includes the articles stage 2 is evaluated on, stage 2's score measures
+memorisation. PubMedQA's configs are disjoint by construction; the notebooks assert it anyway.
 
-If every training example has a confident answer, the model learns that every question has one.
-It then answers confidently when it should decline — the worst failure mode for anything
-retrieval-adjacent, and one installed by the *absence* of data rather than by anything you did.
+**4. Is it ungated, permissively licensed, and small enough?**
+Gated datasets mean token setup for anyone you share the notebook with. Check the licence covers
+what you're doing — some prohibit training. And a config you can pull in seconds beats one that
+eats your Colab session before training starts.
 
-~10% abstention is a reasonable target. This repo sits at ~4%, which is a compromise given the
-small total and is the first thing to fix if you extend it.
+### What was considered here
+
+| candidate | both stages? | verdict |
+|---|---|---|
+| **`qiaojin/PubMedQA`** | ✅ `pqa_unlabeled` raw + `pqa_labeled` pairs | **chosen** — specialised text, gradable yes/no/maybe, disjoint configs, MIT |
+| `rajpurkar/squad` | ✅ contexts + Q/A | Contexts are Wikipedia — no stage-1 headroom |
+| `databricks/databricks-dolly-15k` | ~ | Only half the records have context, and it's Wikipedia again |
+| `armanc/scientific_papers` | ❌ raw only | Would need a second dataset bolted on |
+| `sahil2801/CodeAlpaca-20k` | ❌ pairs only | Same problem, other direction |
+
+### On synthetic data
+
+An earlier version of this repo used a hand-authored fictional corpus with invented terminology.
+That has one genuine advantage — planted facts prove the weights moved, because the base model
+provably could not know them — and one fatal flaw: **it tells you nothing about whether the
+pipeline works on real data**, which is the whole point of building it.
+
+Synthetic instruction data is still a legitimate and common technique, especially the
+seed-and-expand pattern self-instruct popularised: hand-write ~100 seeds, expand with an LLM.
+If you go that route, two things need care. Dedup aggressively — near-duplicates inflate apparent
+dataset size without adding signal. And check the generating model's licence, since some terms
+prohibit training on their outputs.
+
+**One thing worth carrying over regardless of your data source:** include examples where the right
+answer is "I don't know" or "the source doesn't say". A model trained only on confidently-answered
+questions learns that every question has an answer, then answers confidently when it should
+decline. That failure is installed by the *absence* of data, not by anything you did.
 
 ---
 
@@ -429,8 +495,10 @@ small total and is the first thing to fix if you extend it.
 
 | Change | Why |
 |---|---|
-| **More data, both stages** | Highest return by a wide margin. Everything here is data-starved. |
-| **Document-level split in stage 1** | Measures generalisation to unseen documents rather than in-domain fit. |
+| **`pqa_artificial`** | 211k more auto-labelled records for stage 2. Highest return by a wide margin — 800 examples is very few. |
+| **More abstracts in stage 1** | `N_ABSTRACTS` is 1,000 out of 61,249 available. Raise it until the Colab session is the limit. |
+| **Article-level split in stage 1** | Measures generalisation to unseen papers rather than in-domain fit. |
+| **A classification head** | For yes/no/maybe alone, `AutoModelForSequenceClassification` beats generation and is far cheaper to score. |
 | **`r` and `target_modules` sweep** | Both notebooks are set up so this is a one-line change. |
 | **TRL `SFTTrainer`** | Handles packing and completion-only masking. Use it once you know what it's doing. |
 | **QLoRA** | Necessary at 7B+. Note the merge constraint in §3. |
