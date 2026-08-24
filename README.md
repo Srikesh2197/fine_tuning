@@ -38,10 +38,11 @@ articles**, against a **55.0% majority-class baseline** and against the untuned 
 
 | | |
 |---|---|
-| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/feature_base/notebooks/01_domain_adaptation_lora.ipynb) | **01 - Domain adaptation** (non-instructional, LoRA) |
-| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/feature_base/notebooks/02_instruction_finetuning_lora.ipynb) | **02 - Instruction tuning** (LoRA on the merged stage-1 model) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/01_domain_adaptation_lora.ipynb) | **01 - Domain adaptation** (non-instructional, LoRA) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/02_instruction_finetuning_lora.ipynb) | **02 - Instruction tuning** (LoRA on the merged stage-1 model) |
 
-> Badges point at `feature_base`, since `main` is intentionally empty.
+> Badges open the notebooks from `main`. The repo is private, so the first time you use
+> one, Colab will ask to authorise GitHub access — tick **Include private repos**.
 > The notebooks ship **without outputs** - run them yourself, the numbers are the point.
 
 **The notebooks are self-contained.** They pull data from Hugging Face with `load_dataset()` and
