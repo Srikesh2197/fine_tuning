@@ -5,23 +5,27 @@ it to a domain on raw text, then teach it to follow instructions. Both stages us
 end to end on a **free-tier Colab T4**, and both are instrumented so you can tell whether the
 training actually did anything.
 
-The domain is AI/ML engineering inside a large regulated bank.
+Everything comes from one real, public dataset:
+**[`qiaojin/PubMedQA`](https://huggingface.co/datasets/qiaojin/PubMedQA)** (MIT licence).
 
 ```
 unsloth/Llama-3.2-1B  (base — no instruction tuning)
       │
-      │  notebook 01 — domain adaptation on ~30k tokens of raw text
+      │  notebook 01 — domain adaptation on ~292k tokens of raw PubMed abstracts
       │                LoRA #1, ~11M params  ·  no instructions, no prompts
       ▼
-   a model that writes fluent domain prose and cannot answer a question
+   a model that writes fluent abstract prose and cannot answer a question
       │
       │  merge LoRA #1 into the base weights
       │
-      │  notebook 02 — instruction tuning on 295 (instruction, input, output) pairs
+      │  notebook 02 — instruction tuning on 800 expert-annotated Q/A pairs
       │                LoRA #2, ~11M params  ·  loss on the response only
       ▼
-   a model that answers in the domain's language — and stops
+   a model that answers yes/no/maybe with a justification — and stops
 ```
+
+The payoff is a number, not a vibe: stage 2 is scored on **decision accuracy over 200 held-out
+articles**, against a **55.0% majority-class baseline** and against the untuned base model.
 
 ---
 
@@ -29,8 +33,8 @@ unsloth/Llama-3.2-1B  (base — no instruction tuning)
 
 1. Open notebook 01 in Colab (badge below) and set the runtime to **T4 GPU**
    (Runtime -> Change runtime type -> T4 GPU).
-2. Run it top to bottom (~10 min). It saves a LoRA adapter to your Google Drive.
-3. Open notebook 02 and run it top to bottom (~10 min). It picks the adapter up from Drive.
+2. Run it top to bottom (~12 min). It saves a LoRA adapter to your Google Drive.
+3. Open notebook 02 and run it top to bottom (~12 min). It picks the adapter up from Drive.
 
 | | |
 |---|---|
@@ -40,10 +44,9 @@ unsloth/Llama-3.2-1B  (base — no instruction tuning)
 > Badges point at `feature_base`, since `main` is intentionally empty.
 > The notebooks ship **without outputs** - run them yourself, the numbers are the point.
 
-**While the repo is private**, a Colab runtime carries no GitHub credentials, so the notebooks
-cannot `git clone` it. They fall back to looking for the repo in Google Drive at
-`MyDrive`. Either upload the repo folder there once (any folder name works), or make the repo public and the
-clone path works with no further setup.
+**The notebooks are self-contained.** They pull data from Hugging Face with `load_dataset()` and
+need no repo checkout, no clone, and no Drive copy of the repo — so the private-repo problem goes
+away entirely. Drive is still used for one thing: handing the stage-1 adapter to notebook 02.
 
 ---
 
@@ -52,37 +55,42 @@ clone path works with no further setup.
 ```
 notebooks/
   01_domain_adaptation_lora.ipynb      non-instructional fine-tuning, baseline → train → measure
-  02_instruction_finetuning_lora.ipynb merge stage 1, instruction-tune, three-way comparison
-data/
-  domain_corpus/raw/*.md               18 original documents (~21.6k words) — the training text
-  domain_corpus/corpus.jsonl           built artifact: 366 paragraphs
-  instruction/train.jsonl              295 synthetic instruction pairs
-  instruction/eval.jsonl               34 held-out pairs
+  02_instruction_finetuning_lora.ipynb merge stage 1, instruction-tune, score against baselines
 scripts/
-  build_corpus.py                      raw/*.md → corpus.jsonl
-  generate_instructions.py             corpus + hand-authored seeds → instruction pairs
-  validate_data.py                     schema, freshness, dedup, leakage, token budget
+  prepare_data.py                      materialise the prepared data locally (no GPU needed)
+  validate_data.py                     schema, disjointness, stratification, token budgets
+data/
+  README.md                            dataset provenance, splits, licence, honest caveats
 docs/
   concepts.md                          the why: LoRA math, masking, evaluation, common bugs
 ```
 
-Each data directory has its own README covering provenance and design.
+Nothing is committed under `data/` — the notebooks load from the Hub at runtime.
+`scripts/prepare_data.py` writes JSONL there for local inspection (gitignored).
 
 ---
 
-## The corpus, and why it's fictional
+## The data, and why this dataset
 
-The training text describes **Meridian Trust**, an invented Tier-1 bank. Nothing was scraped,
-nothing is reproduced from a real institution's documents, and the prose was written from scratch
-for this repo.
+The requirement was one authentic source feeding **both** stages. PubMedQA does, via configs built
+from different PubMed articles:
 
-That isn't only about avoiding a data-governance problem. It gives us **memorization probes**.
-`Llama-3.2-1B` has never encountered the *Halton scale*, *Gatepost*, *Blue-file*, or *DXI*, so if
-the fine-tuned model completes "an H1 model must be revalidated every" with "six months", that
-string demonstrably came from our training data and nowhere else.
+| stage | config | what we use |
+|---|---|---|
+| 01 — domain adaptation | `pqa_unlabeled` (61,249) | 1,000 abstracts, **questions discarded** — ~292k tokens of raw prose |
+| 02 — instruction tuning | `pqa_labeled` (1,000) | question + abstract → `Answer: yes/no/maybe` + expert justification |
 
-That's a much crisper signal than a perplexity delta of a few tenths — which is exactly why the
-corpus was designed this way. See [`data/domain_corpus/README.md`](data/domain_corpus/README.md).
+Three properties make it a good teaching set:
+
+1. **Genuinely specialised text.** A 1B general model is measurably worse at biomedical abstracts
+   than at Wikipedia, so stage 1 has real headroom. Fine-tuning on SQuAD or Dolly contexts — both
+   Wikipedia — would move perplexity almost not at all.
+2. **Stage 2 is gradable.** Every record carries an expert yes/no/maybe, so accuracy is a number.
+3. **The stages are disjoint at article level**, so stage 2's score isn't measuring what stage 1
+   memorised. Both notebooks assert this rather than trusting it.
+
+`data/README.md` has the full breakdown. `docs/concepts.md` §12 covers what else was considered
+and the criteria to apply to your own data.
 
 ---
 
@@ -97,8 +105,8 @@ like it works when it doesn't:
 |---|---|---|
 | **Loading the adapter** | `AutoModelForCausalLM.from_pretrained(lora_dir)` — silently returns the **base model**, ignoring the adapter files next to it | `PeftModel.from_pretrained` + `merge_and_unload()`, with an assertion that the weights actually changed |
 | **Tokenization** | `padding="max_length"` + `labels = input_ids.copy()` — trains the model to predict pad tokens | Stage 1 packs into fixed blocks (100% real tokens); stage 2 pads dynamically with `labels = -100` |
-| **Instruction loss** | Supervises the whole sequence — the model learns to generate `### Instruction:` headers | Completion-only masking, with a decoded sanity check showing the boundary |
-| **Evidence** | No EOS on targets, no eval split, no baseline | EOS appended and generation length measured; held-out splits; perplexity captured **before** training |
+| **Instruction loss** | Supervises the whole sequence — here that would spend **88%** of the budget regurgitating abstracts | Completion-only masking, with a decoded sanity check showing the boundary |
+| **Evidence** | No EOS on targets, no eval split, no baseline | EOS appended and generation length measured; disjoint splits; perplexity captured **before** training; accuracy against a majority-class baseline |
 
 `docs/concepts.md` §11 documents each one, so the lesson survives beyond this repo.
 
@@ -114,19 +122,21 @@ Two other choices worth flagging:
 
 ## Working locally
 
-The scripts are pure standard library — no GPU, no ML dependencies:
+No GPU needed to inspect the data:
 
 ```bash
-python scripts/build_corpus.py            # rebuild corpus.jsonl from raw/*.md
-python scripts/generate_instructions.py   # rebuild train/eval instruction data
-python scripts/validate_data.py           # full pre-flight: schema, freshness, leakage, budgets
+pip install datasets transformers
+python scripts/prepare_data.py        # writes data/*.jsonl for inspection (gitignored)
+python scripts/validate_data.py       # full pre-flight
 ```
 
-Generation is seeded, so rebuilds are byte-identical unless you change the inputs.
-`validate_data.py` fails if a committed artifact is stale.
+`validate_data.py` checks schema, article-level disjointness between stages, split stratification,
+that the yes/no/maybe grading regex recovers the gold label on 100% of records, and that nothing
+exceeds the notebooks' token budgets. It also parses both notebooks and fails if the constants
+they inline have drifted from `prepare_data.py`.
 
-Editing the corpus is the intended way to make this yours: drop your own documents into
-`data/domain_corpus/raw/`, add an entry to `DOC_SUBJECT` in `build_corpus.py`, rebuild, and rerun.
+To point this at your own data, replace the two `load_dataset` blocks. `docs/concepts.md` §12 has
+the criteria for picking a replacement.
 
 ---
 
@@ -134,20 +144,28 @@ Editing the corpus is the intended way to make this yours: drop your own documen
 
 Fill these in when you run it — the numbers depend on your Colab session.
 
+**Stage 1 — domain adaptation**
+
 | Metric | Baseline | After stage 1 |
 |---|---|---|
-| Perplexity, held-out domain text | | |
-| Perplexity, out-of-domain text | | |
-| Reproduces the invented facts | no | ? |
+| Perplexity, held-out PubMed abstracts | | |
+| Perplexity, out-of-domain prose | | |
+| 8-gram overlap with training continuations | n/a | |
 
-| Question | base | + domain | + domain + instruct |
-|---|---|---|---|
-| "How often must an H1 model be revalidated?" | | | |
+**Stage 2 — decision accuracy on 200 held-out articles**
 
-Roughly what to expect: a real but **modest** perplexity improvement (30k tokens is a small
-corpus), clear adoption of the corpus vocabulary, visible overfitting in the last epochs of stage
-1, and an unmistakable behavioural change after stage 2 — the model answers and stops, where
-before it continued indefinitely.
+| System | Accuracy | Parse rate |
+|---|---|---|
+| Majority class (always "yes") | 55.0% | n/a |
+| base | | |
+| + domain | | |
+| + domain + instruct | | |
+
+What to expect: a clear perplexity drop in stage 1 (biomedical text has real headroom for a 1B
+general model), near-zero parse rates for the two untuned systems — neither has ever been taught
+to emit `Answer:` — and a stage-2 model that answers in the right format and stops. Whether it
+beats 55% on *content* is the genuinely open question at this data scale; the notebook prints a
+confusion matrix so you can see whether it's discriminating or just saying "yes".
 
 ---
 
@@ -161,19 +179,31 @@ transformers==5.15.0    peft==0.20.0    datasets==5.0.1    accelerate==1.14.0
 ```
 
 `torch` is deliberately unpinned — Colab ships a CUDA-matched build and replacing it is slow and
-fragile. A known-good fallback set is commented in the same file, for if the pins ever conflict.
+fragile. Colab's preinstalled `torchao` is uninstalled, because `peft`'s optional integration
+raises rather than degrading when it finds a version below its minimum. A known-good fallback pin
+set is commented in the same file.
 
 **Base model:** [`unsloth/Llama-3.2-1B`](https://huggingface.co/unsloth/Llama-3.2-1B) — an ungated
 mirror of Meta's Llama 3.2 1B **base** weights. Same weights as
 [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B), without the licence
-gate and HF token setup. Use the official repo instead if you'd rather; only `MODEL_ID` changes.
+gate and HF token setup. Only `MODEL_ID` changes if you'd rather use the official repo.
 
 Note it's the **base** model, not `-Instruct`. That's the point: the whole narrative is watching
 instruction-following get installed.
 
 ---
 
+## Caveats
+
+- **This is not medical software.** A 1B model fine-tuned on 800 abstracts is a training-mechanics
+  exercise. Nothing it produces is medical advice.
+- **Our split is not the official PubMedQA benchmark split** (450/50/500). Don't compare these
+  numbers to published leaderboard results.
+- **Both stages are data-starved by design**, to fit a free Colab session. `docs/concepts.md` §13
+  lists what to scale first.
+
 ## Credit
 
 Structure and sequencing follow [sunnysavita10/Complete-LLM-Finetuning](https://github.com/sunnysavita10/Complete-LLM-Finetuning).
-The corpus, instruction data, notebooks, and implementation here are original.
+Data is [PubMedQA](https://huggingface.co/datasets/qiaojin/PubMedQA) (Jin et al., EMNLP 2019,
+[paper](https://arxiv.org/abs/1909.06146)). Notebooks and implementation here are original.
