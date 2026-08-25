@@ -1,17 +1,57 @@
-# Pinned for Google Colab (free-tier T4). Both notebooks install from this file.
+# Pinned for Google Colab (free-tier T4). All three notebooks install from this file.
 #
 # torch is deliberately NOT pinned: Colab ships a CUDA-matched build, and
 # reinstalling it there is slow and frequently breaks the runtime.
 # transformers 5.x requires torch>=2.5 and Python>=3.10 — Colab satisfies both.
 #
-# TRL is deliberately absent. The training loops here use plain
-# transformers.Trainer + peft so the mechanics stay visible, and so the repo is
-# insulated from TRL's ongoing SFTConfig / max_seq_length API churn.
+# TRL is used by notebook 03 ONLY, for DPOTrainer. Notebooks 01 and 02 stay on
+# plain transformers.Trainer + peft so the masking and packing remain visible on
+# the page, and so they are insulated from TRL's ongoing SFTConfig /
+# max_seq_length API churn. The DPO loss is a different case: subtle, easy to get
+# quietly wrong, and TRL's is the reference implementation. See docs/concepts.md
+# section 10.
 
 transformers==5.15.0
 peft==0.20.0
 datasets==5.0.1
 accelerate==1.14.0
+trl==0.29.1
+
+# --- What DPOConfig changes out from under you ------------------------------
+# Read out of trl 0.29.1's source, not recalled. DPOConfig inherits from
+# TrainingArguments via trl's BaseConfig, and BOTH layers move defaults.
+# Notebook 03 sets every one of these explicitly; if you adapt it, keep doing so.
+#
+# Changed by trl (BaseConfig):
+#   gradient_checkpointing      -> True   (with PEFT this needs
+#                                          enable_input_require_grads(), or the
+#                                          first backward dies)
+#   bf16                        -> None, resolved to `not fp16` in __post_init__
+#                                          (so it switches ITSELF on, and a
+#                                          Turing T4 then emulates it, slowly)
+#   logging_steps               -> 10
+#
+# Changed by trl (DPOConfig):
+#   learning_rate               -> 1e-6   (a full-fine-tune rate, far too low for
+#                                          LoRA's ~0.9% of the weights)
+#   loss_type                   -> ["sigmoid"], a LIST since trl 0.29. Passing
+#                                          the bare string is not the same thing.
+#   max_length                  -> 1024, with truncation_mode="keep_start", so
+#                                          overflow eats the completion — the
+#                                          only part DPO scores
+#   beta                        -> 0.1
+#
+# Inherited unchanged from TrainingArguments, and still worth setting, because
+# the defaults suit a different job:
+#   per_device_train_batch_size -> 8      (one DPO example is TWO sequences, and
+#                                          the reference forward doubles it again)
+#   lr_scheduler_type           -> "linear"
+#   save_strategy               -> "steps", every 500
+#
+# Note also that trl's preference collator passes `padding_side` explicitly on
+# every call (left for prompts, right for completions), so it neither needs nor
+# reads the padding side of the tokenizer you hand it as `processing_class`.
+# Notebook 03 still left-pads, for its own batched generation.
 
 # --- Fallback pin set -------------------------------------------------------
 # If the pins above ever conflict with Colab's preinstalled torch, this older
@@ -27,6 +67,6 @@ accelerate==1.14.0
 # Colab ships torchao 0.10.x. peft's optional torchao integration RAISES an
 # ImportError rather than degrading when it finds a version below its 0.16.0
 # minimum, and the check fires inside get_peft_model(). Nothing in this repo
-# uses torchao, so both notebooks uninstall it:
+# uses torchao, so all three notebooks uninstall it:
 #
 #     %pip uninstall -q -y torchao
