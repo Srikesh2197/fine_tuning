@@ -1,4 +1,5 @@
-# Pinned for Google Colab (free-tier T4). All three notebooks install from this file.
+# Pinned for Google Colab. Notebooks 01-03 run on the free-tier T4; notebook 04 needs an
+# A100 or L4 (see the bitsandbytes section at the bottom). All four install from this file.
 #
 # torch is deliberately NOT pinned: Colab ships a CUDA-matched build, and
 # reinstalling it there is slow and frequently breaks the runtime.
@@ -10,12 +11,18 @@
 # max_seq_length API churn. The DPO loss is a different case: subtle, easy to get
 # quietly wrong, and TRL's is the reference implementation. See docs/concepts.md
 # section 10.
+#
+# bitsandbytes is used by notebook 04 ONLY, for 4-bit NF4 weights and the paged
+# 8-bit optimizer. Notebooks 01-03 hold the base model in fp16 on purpose: they
+# merge an adapter into the base weights between every stage, and merging into a
+# quantized base is lossy. Notebook 04 measures how lossy. See section 16.
 
 transformers==5.15.0
 peft==0.20.0
 datasets==5.0.1
 accelerate==1.14.0
 trl==0.29.1
+bitsandbytes==0.50.2
 
 # --- What DPOConfig changes out from under you ------------------------------
 # Read out of trl 0.29.1's source, not recalled. DPOConfig inherits from
@@ -52,6 +59,25 @@ trl==0.29.1
 # every call (left for prompts, right for completions), so it neither needs nor
 # reads the padding side of the tokenizer you hand it as `processing_class`.
 # Notebook 03 still left-pads, for its own batched generation.
+
+# --- bitsandbytes, notebook 04 only -----------------------------------------
+# Requires torch>=2.4 (Colab satisfies this) and a CUDA build. Two things about
+# it are worth knowing before you copy notebook 04's config elsewhere:
+#
+#   bnb_4bit_compute_dtype  defaults to torch.float32. That is not the storage
+#                           dtype - it is the precision every matmul runs in
+#                           after the block is dequantized. Left at the default
+#                           you pay fp32 matmul cost for weights that cannot
+#                           supply fp32 precision. Notebook 04 sets bfloat16.
+#   bnb_4bit_quant_type     defaults to "fp4". "nf4" is strictly better for
+#                           normally-distributed weights at the same bit cost.
+#
+# Also note that p.numel() under-reports on a 4-bit model: Params4bit packs two
+# weights per uint8. Notebook 04 counts Linear4bit by its logical shape instead.
+#
+# The paged optimizers (optim="paged_adamw_8bit") come from here too. With LoRA
+# the 8-bit state saves a few hundred MB at most; the paging - spilling to host
+# RAM instead of raising CUDA OOM - is the part that earns its place.
 
 # --- Fallback pin set -------------------------------------------------------
 # If the pins above ever conflict with Colab's preinstalled torch, this older

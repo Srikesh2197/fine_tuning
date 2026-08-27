@@ -131,9 +131,19 @@ that are hard to predict and harder to attribute when something regresses. Mergi
 you'd hand stage 1 to someone else as a base model.
 
 **One consequence worth knowing:** you cannot cleanly merge into quantized weights. That is why
-this repo loads the 1B model in fp16 rather than using QLoRA — the merge in notebook 02 is the
-whole architecture, and 4-bit would break it. At 7B+ you'd need QLoRA and would have to
-restructure (merge in fp16 on CPU, or keep the adapters stacked and accept the coupling).
+notebooks 01-03 load the 1B model in fp16 rather than using QLoRA — the merge is the whole
+architecture, and 4-bit would corrupt it at every stage boundary.
+
+Be precise about what "cannot cleanly" means, because the obvious reading is wrong. PEFT does
+**not** refuse to merge into a `Linear4bit`; it dequantizes, adds $\frac{\alpha}{r}BA$, and
+requantizes the result, warning about rounding rather than raising. So the merge succeeds and the
+damage is silent. What decides whether it matters is the size of the requantization error relative
+to the size of the update you trained — and notebook 04 §14 measures exactly that ratio, on a real
+adapter, then re-scores the merged model to see whether the loss shows up on the task.
+
+At 7B+ you need QLoRA, so you restructure: merge in fp16 on CPU (§16), keep the adapters stacked
+and accept the coupling, or do what notebook 04 does and train a single adapter so nothing has to
+be merged at all.
 
 ---
 
@@ -289,8 +299,12 @@ for _, p in model.named_parameters():
         p.data = p.data.float()
 ```
 
-This is what `prepare_model_for_kbit_training` does for QLoRA. Both notebooks do it explicitly so
-it's visible rather than magic.
+This is roughly what `prepare_model_for_kbit_training` does for QLoRA, and notebooks 01 and 02 do
+it explicitly so it's visible rather than magic. "Roughly" is doing work in that sentence: the
+real helper also freezes the base weights, upcasts the layernorms (and, on a large-vocabulary
+model, the embeddings and `lm_head` — which is not free), and wires gradient checkpointing.
+Notebook 04 §9 calls it and prints the parameter-dtype census and the footprint change on both
+sides of the call, so the difference between the hand-rolled loop and the helper is visible too.
 
 ---
 
@@ -581,7 +595,10 @@ to DPO:
   optimizer step at the notebook's own `gradient_accumulation_steps=8`.
 - **`load_in_8bit=True` immediately before `merge_and_unload()`.** The base is loaded quantized,
   then the instruction adapter is merged into it. Merging a fp16 update into 8-bit weights is
-  exactly the operation §3 says not to perform, and it is why this repo does not quantize at all.
+  exactly the operation §3 says not to perform. Note that it does not *fail* — that is what makes
+  it a bug worth naming rather than a crash worth fixing. Notebook 04 §14 performs the same
+  operation deliberately, at 4-bit, and reports the requantization error against the size of the
+  update, so the cost this notebook pays without noticing has a number attached to it.
 - **`tokenizer.pad_token = tokenizer.eos_token`**, the aliasing §7 covers, and here it lands in a
   stage that is already prone to unlearning EOS.
 - **No eval split and no metric.** All five pairs are used for training, `eval_dataset` is never
@@ -668,8 +685,187 @@ decline. That failure is installed by the *absence* of data, not by anything you
 | **A classification head** | For yes/no/maybe alone, `AutoModelForSequenceClassification` beats generation and is far cheaper to score. |
 | **`r` and `target_modules` sweep** | Both notebooks are set up so this is a one-line change. |
 | **TRL `SFTTrainer`** | Handles packing and completion-only masking. Use it once you know what it's doing. |
-| **QLoRA** | Necessary at 7B+. Note the merge constraint in §3. |
+| **QLoRA** | Necessary at 7B+. **Implemented in notebook 04** — see §16 and the merge constraint in §3. |
 | **Unsloth** | ~2× faster, lower memory, for exactly this workload. |
 | **A $\beta$ sweep for stage 3** | The one DPO hyperparameter that changes *what* is optimised rather than how fast. See §10. |
 | **ORPO or KTO** | ORPO needs no reference model; KTO needs no pairs. Both are cheaper than DPO. See §11. |
 | **GGUF export** | `llama.cpp` conversion to run the merged model locally. |
+
+---
+
+## 16. Quantization and QLoRA
+
+Notebooks 01-03 never quantize. Notebook 04 does nothing else. This section is the reasoning that
+separates them.
+
+### The problem quantization solves
+
+A 1B model in fp16 is 2.5 GB and fits anywhere. An 8B model in fp16 is **16 GB** — before
+activations, before gradients, before optimizer state. On a 24 GB card that is already
+uncomfortable; on a 16 GB card it does not load at all. Every fine-tuning technique past this point
+is a way of not paying 2 bytes per weight for a tensor you are never going to update.
+
+LoRA already froze the base model. Quantization asks the obvious follow-up: if those weights are
+frozen, why are they stored at training precision?
+
+### 16.1 Blockwise absmax, and why it is blockwise
+
+Quantizing to 4 bits means mapping every weight onto one of 16 values. Weights do not live in
+$[0, 15]$, so each is first divided by a scale.
+
+Using **one scale per tensor** is what makes naive quantization fail: a single outlier sets the
+scale for millions of weights, and everything else collapses onto two or three levels. So the
+scale is computed **per block** — bitsandbytes uses 64 weights per block, each divided by its own
+`absmax`. An outlier then ruins the resolution of its 63 neighbours and nobody else.
+
+This is why quantization error is reported per tensor and varies a lot between tensors: it depends
+entirely on how the outliers are distributed inside it.
+
+### 16.2 NF4 vs FP4
+
+Given 16 levels, where do you put them?
+
+**FP4** spaces them like a tiny floating-point format. **NF4** — 4-bit NormalFloat — places them at
+the **quantiles of a standard normal distribution**, so each level is equally likely to be used by
+a weight drawn from that distribution. Trained transformer weights are close enough to normal for
+this to be a real gain, and it is information-theoretically optimal for data that actually is
+normal.
+
+It costs exactly the same 4 bits. `bnb_4bit_quant_type="nf4"` is a free improvement over the
+`"fp4"` default, and there is no reason to leave the default in place.
+
+### 16.3 Double quantization, in bits
+
+The per-block `absmax` values are fp32. At one per 64 weights:
+
+$$\frac{32 \text{ bits}}{64 \text{ weights}} = 0.5 \text{ bits per weight}$$
+
+That is **12.5% overhead on a 4-bit budget** — the quantization constants are not a rounding error
+in the accounting, they are a line item. Double quantization quantizes them too: the absmax values
+go to 8-bit, with one fp32 scale per 256 of them.
+
+$$\frac{8}{64} + \frac{32}{64 \times 256} \approx 0.127 \text{ bits per weight}$$
+
+So the real cost is about **4.13 bits per weight** rather than 4.5. On an 8B model that is roughly
+0.3 GB, for no measurable accuracy cost. `bnb_4bit_use_double_quant=True` is close to free.
+
+### 16.4 Storage dtype is not compute dtype
+
+The argument people leave out:
+
+```python
+bnb_4bit_compute_dtype=torch.bfloat16
+```
+
+Weights are *stored* in 4 bits. They are not *multiplied* in 4 bits. Every matmul dequantizes its
+block back to the compute dtype and computes there, at full width. Quantization is a memory
+technique that happens to cost some time, not a reduced-precision arithmetic technique.
+
+The default is `torch.float32`, and leaving it there is a real mistake in both directions: you pay
+fp32 matmul cost and bandwidth for weights that cannot supply fp32 precision. On Ampere or later,
+set it to bfloat16. On a GPU with no native bf16 — a T4 — it has to be fp16, and the whole
+dequantize-then-matmul path is slow enough that notebook 04 refuses to run there rather than
+quietly taking four hours.
+
+### 16.5 Why the adapters are not quantized
+
+This is the QLoRA insight, and it is a single sentence: **quantize what is frozen, keep precision
+where the gradients go.**
+
+The base weights receive no updates, so 4 bits of resolution costs only a little accuracy in the
+forward pass. The LoRA matrices *do* receive updates — and a gradient step that is smaller than
+one quantization level would be rounded away entirely. So $A$ and $B$ are created fresh in fp32
+and stay there. They are ~0.5% of the parameters, so this costs almost nothing.
+
+Gradients still flow *through* the quantized weights — backprop dequantizes just as the forward
+pass does — they just never land on them.
+
+### 16.6 The footprint is never `params ÷ 4`
+
+Two reasons, and both surprise people mid-OOM.
+
+**bitsandbytes only converts `nn.Linear`.** Embeddings are `nn.Embedding` and are never touched;
+the `lm_head` is skipped by default, because quantizing the output projection costs real accuracy.
+On Llama-3.1-8B those two tensors are 525M parameters each, so **~2.1 GB stays in bf16** — about a
+third of the loaded footprint.
+
+**`prepare_model_for_kbit_training` then upcasts them to fp32**, doubling that again. A "4-bit 8B"
+lands nearer 7.8 GB than the 4 GB the arithmetic suggests.
+
+There is a third trap worth naming because it is silent: **`p.numel()` under-reports on a
+quantized model.** `Params4bit` packs two weights into each `uint8` and stores them reshaped, so
+summing `numel()` halves every quantized layer. Count `Linear4bit` by `in_features × out_features`
+instead. Notebook 04 §4 prints both counts side by side.
+
+### 16.7 `prepare_model_for_kbit_training`
+
+§8 introduces this as the thing notebooks 01 and 02 do by hand. The real helper does four things:
+
+1. Freezes every base parameter.
+2. Upcasts remaining fp16/bf16 parameters to fp32 — layernorms above all, which are
+   precision-sensitive and cheap.
+3. Enables gradient checkpointing.
+4. Calls `enable_input_require_grads()`.
+
+The fourth is the one that bites when hand-rolled. Under gradient checkpointing, the frozen
+embedding layer emits activations that do not require grad, checkpointing has no graph to attach
+to, and the first backward dies with:
+
+```
+RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
+```
+
+which names nothing you wrote.
+
+### 16.8 Paged optimizers, and what they are actually for
+
+`optim="paged_adamw_8bit"` bundles two independent things.
+
+**8-bit state.** AdamW holds two moments per trainable parameter. At 42M LoRA parameters that is
+~336 MB in fp32 against ~84 MB in 8-bit. Genuine, but not decisive — with LoRA the trainable set is
+tiny by construction. This option matters far more when the thing being trained is the whole model.
+
+**Paging.** The optimizer state lives in unified memory and can spill to host RAM under pressure,
+so a transient spike raises latency instead of `CUDA out of memory` forty minutes into a run. On
+rented hardware that is the part worth having.
+
+Do not cite the memory saving as the reason for using it on a LoRA run. The number does not support
+the claim, and notebook 04 prints it so you can see that.
+
+### 16.9 The merge constraint, quantified
+
+§3 says you cannot cleanly merge into quantized weights. The mechanism:
+
+$$W' = W + \tfrac{\alpha}{r}BA \qquad\text{but what is stored is}\qquad Q^{-1}(Q(W'))$$
+
+The requantization error $\varepsilon = Q^{-1}(Q(W')) - W'$ is noise added on top of the update you
+just trained. PEFT does this without complaint — a warning, not an exception — so nothing stops you
+shipping the result.
+
+The number that decides whether it matters is not $\|\varepsilon\|$ but the ratio:
+
+$$\frac{\|\varepsilon\|}{\|\Delta W\|}$$
+
+If it approaches 1, merging discards about as much as training added. LoRA updates are small
+perturbations of the base weights by design, which is precisely what makes them vulnerable — the
+noise floor of the 4-bit grid does not shrink just because the update did.
+
+Notebook 04 §14 measures this on a real adapter, merges anyway, re-scores on the held-out 200, and
+runs a paired McNemar test on the difference. "Not detectable at n=200" is a likely outcome and is
+not the same as "harmless".
+
+**If you need a merged checkpoint, merge at full precision instead**: load the base in bf16 on
+CPU, apply the adapter, merge there, and quantize the *result* if you want to. Quantizing after
+merging is a well-behaved operation; quantizing during it is not.
+
+### 16.10 When not to quantize
+
+- **When the model already fits.** Quantization costs accuracy and speed. At 1B in fp16 on a 16 GB
+  card there is nothing to buy. This is why notebooks 01-03 do not use it.
+- **When you merge between stages.** §3 and §16.9 — the architecture and the technique are in
+  direct conflict, and the conflict is silent.
+- **When you are about to serve it.** For inference-only deployment, GPTQ and AWQ calibrate against
+  real data and generally beat round-to-nearest NF4. bitsandbytes is optimised for the
+  train-time case.
+- **When 8-bit would do.** `load_in_8bit=True` costs about twice the memory of 4-bit and loses far
+  less. Reach for 4-bit because you measured that you needed it.

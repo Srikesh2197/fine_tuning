@@ -8,6 +8,10 @@ instrumented so you can tell whether the training actually did anything.
 Everything comes from one real, public dataset:
 **[`qiaojin/PubMedQA`](https://huggingface.co/datasets/qiaojin/PubMedQA)** (MIT licence).
 
+A fourth notebook runs alongside the pipeline rather than after it: **QLoRA at 8B**, 4-bit base
+weights, scored on the same held-out records as stage 2. That one needs an A100 or L4 — see
+[Notebook 04](#notebook-04--qlora-at-8b) below.
+
 ```
 unsloth/Llama-3.2-1B  (base — no instruction tuning)
       │
@@ -46,12 +50,15 @@ produce one.
 2. Run it top to bottom (~12 min). It saves a LoRA adapter to your Google Drive.
 3. Open notebook 02 and run it top to bottom (~12 min). It picks the adapter up from Drive.
 4. Open notebook 03 and run it top to bottom (~35 min). It needs **both** earlier adapters.
+5. Optional, and **not free-tier**: notebook 04 (QLoRA at 8B, ~60 min) needs an **A100 or L4**.
+   It is standalone — no adapters from the other three, nothing handed to them.
 
 | | |
 |---|---|
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/01_domain_adaptation_lora.ipynb) | **01 - Domain adaptation** (non-instructional, LoRA) |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/02_instruction_finetuning_lora.ipynb) | **02 - Instruction tuning** (LoRA on the merged stage-1 model) |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/03_preference_tuning_dpo.ipynb) | **03 - Preference tuning** (DPO on self-generated pairs) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/04_qlora_instruction_tuning.ipynb) | **04 - QLoRA at 8B** (4-bit NF4, standalone) — **A100/L4, not T4** |
 
 > Badges open the notebooks from `main`. The repo is private, so the first time you use
 > one, Colab will ask to authorise GitHub access — tick **Include private repos**.
@@ -72,6 +79,7 @@ notebooks/
   01_domain_adaptation_lora.ipynb      non-instructional fine-tuning, baseline → train → measure
   02_instruction_finetuning_lora.ipynb merge stage 1, instruction-tune, score against baselines
   03_preference_tuning_dpo.ipynb       merge stages 1+2, mine preference pairs, DPO, re-score
+  04_qlora_instruction_tuning.ipynb    4-bit NF4 on an 8B base, and what merging into it costs
 scripts/
   prepare_data.py                      materialise the prepared data locally (no GPU needed)
   validate_data.py                     schema, disjointness, stratification, token budgets
@@ -96,6 +104,7 @@ from different PubMed articles:
 | 01 — domain adaptation | `pqa_unlabeled` (61,249) | 1,000 abstracts, **questions discarded** — ~292k tokens of raw prose |
 | 02 — instruction tuning | `pqa_labeled` (1,000) | question + abstract → `Answer: yes/no/maybe` + expert justification |
 | 03 — preference tuning | `pqa_labeled`, the same 800 training rows | (chosen, rejected) pairs **mined from the stage-2 model's own samples**, graded against the expert label |
+| 04 — QLoRA (parallel) | `pqa_labeled` | the **same** 800 train / 200 eval split as stage 2, so the 8B number is comparable |
 
 Three properties make it a good teaching set:
 
@@ -134,9 +143,10 @@ like it works when it doesn't:
 
 Two other choices worth flagging:
 
-- **No quantization.** The 1B model loads in fp16, not 4-bit. Not because QLoRA is bad — because
-  you cannot cleanly `merge_and_unload()` into quantized weights, and the merge between stages is
-  the whole architecture here.
+- **No quantization in stages 1-3.** The 1B model loads in fp16, not 4-bit. Not because QLoRA is
+  bad — because the merge between stages is the whole architecture here, and merging into
+  quantized weights is lossy. Notebook 04 is where QLoRA lives, structured so that it never has to
+  merge, and section 14 of it puts an actual number on what the merge would have cost.
 - **TRL only where it earns its place.** Stages 1 and 2 use plain `Trainer` + `peft`, so the
   masking and packing stay visible rather than handled by `SFTTrainer` behind the scenes — write it
   by hand once first. Stage 3 uses TRL's `DPOTrainer`, because the DPO loss is subtle and TRL's is
@@ -157,7 +167,7 @@ python scripts/validate_data.py       # full pre-flight
 
 `validate_data.py` checks schema, article-level disjointness between stages, split stratification,
 that the yes/no/maybe grading regex recovers the gold label on 100% of records, and that nothing
-exceeds the notebooks' token budgets. It also parses both notebooks and fails if the constants
+exceeds the notebooks' token budgets. It also parses all four notebooks and fails if the constants
 they inline have drifted from `prepare_data.py`.
 
 To point this at your own data, replace the two `load_dataset` blocks. `docs/concepts.md` §14 has
@@ -187,6 +197,23 @@ Fill these in when you run it — the numbers depend on your Colab session.
 | + domain + instruct | | | |
 | + domain + instruct + dpo | | | |
 
+**Notebook 04 — QLoRA at 8B, on the same 200 held-out articles**
+
+| System | Accuracy | Parse rate | Mean tokens |
+|---|---|---|---|
+| Majority class (always "yes") | 55.0% | n/a | n/a |
+| 8B 4-bit base (adapter off) | | | |
+| 8B 4-bit + QLoRA | | | |
+| 8B 4-bit + QLoRA, merged in | | | |
+
+| Quantization measurement | Value |
+|---|---|
+| 4-bit footprint / fp16 equivalent | / 16.1 GB |
+| Footprint after `prepare_model_for_kbit_training` | |
+| Peak GPU memory during training | |
+| Requantization error / LoRA update, `‖err‖ / ‖dW‖` | |
+| McNemar p, merged vs unmerged | |
+
 **Stage 3 — the preference objective itself**
 
 | Metric | Step 0 | Final |
@@ -202,6 +229,12 @@ to emit `Answer:` — and a stage-2 model that answers in the right format and s
 beats 55% on *content* is the genuinely open question at this data scale; the notebook prints a
 confusion matrix so you can see whether it's discriminating or just saying "yes".
 
+For notebook 04, expect the 4-bit base to parse near 0% (it has never been taught to emit
+`Answer:`) and the QLoRA row to answer in the right format. Whether 8B beats the 1B pipeline on
+*content* is confounded — that pipeline had a domain-adaptation stage this notebook does not — so
+read it as scale context, not as a controlled result. The measurement worth trusting is
+`‖err‖ / ‖dW‖`: it says how much of the trained update a merge into 4-bit would throw away.
+
 For stage 3, expect the reward margin to rise and `rewards/chosen` to go **negative** — DPO widens
 the margin mostly by suppressing the rejected answer rather than promoting the chosen one. That is
 normal, and it is also why the margin alone proves nothing. The accuracy row and the McNemar
@@ -216,7 +249,8 @@ Pinned in [`requirements-colab.txt`](requirements-colab.txt), verified against P
 transformers v5 source:
 
 ```
-transformers==5.15.0    peft==0.20.0    datasets==5.0.1    accelerate==1.14.0    trl==0.29.1
+transformers==5.15.0    peft==0.20.0    datasets==5.0.1    accelerate==1.14.0
+trl==0.29.1             bitsandbytes==0.50.2
 ```
 
 `trl` is used by notebook 03 only. Its `DPOConfig` **moves several defaults** — `learning_rate` to
@@ -224,6 +258,13 @@ transformers==5.15.0    peft==0.20.0    datasets==5.0.1    accelerate==1.14.0   
 `loss_type` to a `list` rather than a string — and each one fails quietly rather than loudly.
 Notebook 03 sets all of them explicitly, and `requirements-colab.txt` records which layer moves
 which.
+
+`bitsandbytes` is used by notebook 04 only. Two of `BitsAndBytesConfig`'s defaults are worth
+overriding rather than inheriting: `bnb_4bit_compute_dtype` defaults to **fp32** — it is the matmul
+precision, not the storage precision, so the default makes you pay for precision the 4-bit weights
+cannot supply — and `bnb_4bit_quant_type` defaults to `"fp4"` when `"nf4"` is strictly better at
+the same bit cost. `requirements-colab.txt` records both, the same way it records what `DPOConfig`
+moves.
 
 `torch` is deliberately unpinned — Colab ships a CUDA-matched build and replacing it is slow and
 fragile. Colab's preinstalled `torchao` is uninstalled, because `peft`'s optional integration
@@ -238,6 +279,19 @@ gate and HF token setup. Only `MODEL_ID` changes if you'd rather use the officia
 Note it's the **base** model, not `-Instruct`. That's the point: the whole narrative is watching
 instruction-following get installed.
 
+### Notebook 04 — QLoRA at 8B
+
+Notebooks 01-03 run on a free T4. **Notebook 04 does not**, and asserts an Ampere-or-later GPU
+rather than falling back: 4-bit compute on a GPU with no native bfloat16 turns a one-hour run into
+most of an afternoon. It defaults to
+[`unsloth/Meta-Llama-3.1-8B`](https://huggingface.co/unsloth/Meta-Llama-3.1-8B) (ungated, and it
+shares a tokenizer with the 1B, so notebook 02's token budget carries over unchanged), with
+[`Qwen/Qwen2.5-7B`](https://huggingface.co/Qwen/Qwen2.5-7B) one switch away.
+
+It is standalone: it takes no adapter from the earlier notebooks and hands none back. That is
+deliberate — stages 1→2→3 merge between stages, and merging into 4-bit weights is the operation
+this repo argues against. Training a single adapter means never having to.
+
 ---
 
 ## Caveats
@@ -251,6 +305,9 @@ instruction-following get installed.
 - **A 200-record accuracy difference under ~7 points is noise.** That is roughly the 95% interval
   for a proportion near 55% at n=200. Notebook 03 reports a paired McNemar test precisely so that a
   stage-3 result inside that band gets called what it is.
+- **Notebook 04 is not free-tier**, and its 8B-vs-1B comparison is confounded by the missing
+  domain-adaptation stage as well as by scale. It is a QLoRA demonstration with an honest metric
+  attached, not a clean scaling study.
 - **Stage 3 tunes a proxy for preference, not preference.** "Chosen" means "agreed with the
   expert's yes/no/maybe". Real preference data encodes helpfulness, hedging and tone, none of which
   a regex can grade.
