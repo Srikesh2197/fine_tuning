@@ -17,12 +17,17 @@ domain adaptation    10⁶–10¹⁰ tokens of raw DOMAIN text, same objective  
 instruction tuning   10³–10⁶ (request, response) pairs, loss on response only  ← notebook 02
      │               → a model that answers when addressed
      ▼
-preference tuning    (chosen, rejected) pairs — DPO / ORPO / RLHF              ← not covered
+preference tuning    (chosen, rejected) pairs — DPO / ORPO / RLHF              ← notebook 03
                      → a model that answers the way people prefer
 ```
 
-Every stage optimises the **same** objective: predict the next token. What changes is the data
-and which tokens are scored. That's the whole idea, and holding onto it makes the rest obvious.
+The first three rungs all optimise the **same** objective: predict the next token. What changes is
+the data and which tokens are scored. That's the whole idea, and holding onto it makes most of the
+rest obvious.
+
+**Preference tuning is where that stops being true**, which is why it is the interesting one. It has
+no gold target to predict — only two candidate answers and an ordering between them — so the loss
+is computed over a *margin* rather than over tokens. §10 works through what that changes.
 
 ### Non-instructional fine-tuning, specifically
 
@@ -350,7 +355,147 @@ The first is free and the most frequently omitted. On PubMedQA's 55/34/11 label 
 that answers "yes" to everything scores 55%, which looks respectable in isolation. Notebook 02
 prints a confusion matrix precisely so that outcome is visible rather than flattering.
 
-## 10. When *not* to fine-tune
+## 10. Preference tuning, and what DPO actually optimises
+
+Stages 1 and 2 both had a gold answer to imitate. Stage 3 does not. It has a **prompt and two
+candidate answers**, plus the knowledge that one is better than the other. Nothing says how much
+better, and nothing says what the ideal answer would have been.
+
+RLHF handles that by training a reward model on the comparisons, then optimising the policy against
+it with PPO — two models, two training loops, and a notoriously fiddly middle. **DPO's contribution
+is the observation that you never needed the reward model.** For the KL-constrained objective RLHF
+optimises, the optimal policy has a closed form, and it can be rearranged so the reward is expressed
+in terms of the policy itself. Substituting that back into the reward model's own loss leaves a
+plain binary classification loss over pairs:
+
+$$\mathcal{L}_\text{DPO} = -\log \sigma\!\left(\beta\left[\log\frac{\pi_\theta(y^+\!\mid x)}{\pi_\text{ref}(y^+\!\mid x)} - \log\frac{\pi_\theta(y^-\!\mid x)}{\pi_\text{ref}(y^-\!\mid x)}\right]\right)$$
+
+Read it as: *raise the log-probability the model assigns to the better answer, relative to what the
+frozen starting model assigned it, by more than you raise it for the worse answer.* One model, one
+loop, no sampling during training.
+
+### The reference model, and why it is not free by accident
+
+$\pi_\text{ref}$ is the frozen model you started from. It appears in the loss twice, so every step
+needs its log-probabilities as well as the policy's, and the obvious implementation keeps a second
+full copy of the weights in memory. On a 16 GB T4 with a 1B model that is the difference between
+fitting and not.
+
+With LoRA it costs almost nothing, because the base weights are frozen and shared: the reference is
+the *same* weights with the adapter contribution removed. Worth knowing exactly how TRL implements
+that, because the usual description is wrong. Given a PEFT model and `ref_model=None`, trl 0.29
+**adds a second adapter named `ref`** — a frozen copy of yours, taken when the trainer is
+constructed — rather than toggling your adapter off at each reference forward. The distinction
+matters in three places:
+
+- the model now carries two adapters, so `save_pretrained()` will write both unless you pass
+  `selected_adapters=["default"]`
+- the reference is fixed at *construction* time, so a partly-trained adapter would be silently
+  baked in as the anchor
+- since LoRA initialises $B$ to zero, a fresh adapter makes the copy the identity, and the
+  reference is therefore exactly the model you merged — which is the only reason the arrangement
+  is sound
+
+Notebook 03 asserts all of this rather than trusting it, and the cheapest assertion is the
+strongest: **at step 0 the reward margin must be exactly zero.** If policy and reference are the
+same function, every log-ratio in the loss is $\log 1$. A non-zero margin at step 0 means the
+reference is not the model you think it is, and nothing downstream means anything.
+
+### $\beta$
+
+$\beta$ is the KL constraint, carried over from the RLHF objective DPO replaces. Low $\beta$ lets
+the policy drift far from the reference and chase the preference hard; high $\beta$ keeps it close
+and it learns less. As $\beta \to \infty$ nothing moves. `0.1` is the paper's value and a reasonable
+first guess. It is also the one hyperparameter that changes *what* DPO does rather than how fast it
+does it, so it is the first thing to sweep.
+
+### Reading the reward curves honestly
+
+DPO logs an implicit reward per side, $r(y) = \beta \log \frac{\pi_\theta(y \mid x)}{\pi_\text{ref}(y \mid x)}$.
+It is not a quality score — it is only how much more, or less, likely the tuned model finds an
+answer than the model it started from.
+
+**`rewards/margins` will rise. That is not evidence of anything.** The margin is a difference, and
+gradient descent can widen it from either end. Making text *less* likely is far easier than making
+it more likely, so the optimiser overwhelmingly picks that end: `rewards/rejected` plunges,
+`rewards/chosen` drifts negative too, and the margin grows the whole time. A model that has simply
+learned to suppress its own output distribution produces exactly the curve people screenshot as
+success.
+
+So watch **`rewards/chosen`**, not the margin. A gentle decline is normal — especially with
+off-policy preferred answers (§11). A collapse means the learning rate is too high or $\beta$ too
+low. And regardless of what the curves say, the only thing that settles whether the model got
+better is a task metric on held-out data, which is why notebook 03 goes back to notebook 02's
+200-article accuracy test rather than declaring victory at the loss curve.
+
+### The alternatives, in one line each
+
+| method | what it changes |
+|---|---|
+| **DPO** | The baseline here: pairs, a frozen reference, a sigmoid loss over the margin. |
+| **SimPO** (`loss_type=["sigmoid_norm"]`) | Length-normalises the log-probabilities, so the loss cannot be won by being shorter. The direct fix when the length audit finds a gap. |
+| **IPO** | Replaces the sigmoid with a squared loss, which stops the model driving the margin to infinity on easy pairs. |
+| **ORPO** | Folds the preference term into the SFT loss. No reference model and no separate stage at all. |
+| **KTO** | Takes thumbs-up / thumbs-down on single answers instead of pairs. Far cheaper to collect. |
+| **PPO / GRPO** | Actual RL against a reward model. What DPO is a shortcut for. |
+
+---
+
+## 11. Where preference pairs come from
+
+This is the part that decides whether a preference stage teaches anything, and it gets about one
+sentence in most write-ups.
+
+### Hand-written pairs teach the API, not the model
+
+The tutorial default is a small CSV of `(prompt, chosen, rejected)` triples written by the author —
+often a handful. Two things go wrong, and they compound.
+
+**They are trivially separable.** A rejected answer written to be obviously bad differs from the
+chosen one in surface features: it is shorter, blunter, more absolute, phrased differently. DPO will
+find the cheapest signal that separates the two, learn *that*, and report a beautiful reward margin.
+The behaviour you cared about is untouched.
+
+**They are off-policy.** The DPO derivation assumes the comparisons are drawn from the distribution
+being optimised. Answers the model would never produce carry no information about how to reallocate
+probability mass among the answers it *does* produce. You end up penalising text that already had
+negligible probability, which costs a gradient step and buys nothing.
+
+### On-policy mining
+
+The alternative is to make the model generate its own negatives. Sample $k$ answers per training
+prompt at a temperature high enough that the model disagrees with itself, grade them, and pair a
+good one against a bad one. Both sides then come from the policy, and the loss is being asked the
+question it was derived to answer: *of the things you actually say, which should you say more?*
+
+This needs a grader, which is the real constraint — and it is why the dataset choice in §14 matters
+for a third time. PubMedQA carries an expert `yes/no/maybe` per record, so the grader is the same
+regex notebook 02 is scored with. Without a machine-checkable label you need human annotation or an
+LLM judge, and the LLM judge brings its own biases (notably toward length and confidence).
+
+Three things then need auditing before you train, because each is a way the dataset can quietly
+lie:
+
+| risk | check | why |
+|---|---|---|
+| **Length bias** | mean tokens, chosen vs rejected | If rejected answers skew long, DPO learns "be brief" and you report it as "learned to be correct". The most common self-deception in preference tuning. |
+| **Provenance** | what fraction of `chosen` is on-policy | Falling back to an expert answer when every sample was wrong puts you back off-policy on the preferred side. Useful, but it is the usual reason `rewards/chosen` falls. |
+| **Leakage** | pair articles ∩ held-out articles | Pairs mined from test articles turn the final metric into a third round of training on the test set. |
+
+### Proxy preferences are not preferences
+
+Worth saying plainly, because the vocabulary invites overclaiming. "Chosen" in notebook 03 means
+"agreed with the expert's yes/no/maybe". That is a correctness label wearing a preference label's
+clothes. Real preference data encodes helpfulness, tone, hedging, appropriate refusal, willingness
+to say "I don't know" — none of which a regex can grade, and most of which is why RLHF exists.
+
+What the pipeline genuinely demonstrates is the *mechanism*: how comparisons become a loss, how the
+reference policy is arranged, and how to tell a real improvement from a moved number. Scaling it to
+preferences worth the name means replacing the grader, not the trainer.
+
+---
+
+## 12. When *not* to fine-tune
 
 Sensible order for closing a capability gap:
 
@@ -374,12 +519,13 @@ did something prompting couldn't have done more cheaply and reversibly.
 
 ---
 
-## 11. Bugs in the reference notebooks
+## 13. Bugs in the reference notebooks
 
 This repo is built from [sunnysavita10/Complete-LLM-Finetuning](https://github.com/sunnysavita10/Complete-LLM-Finetuning)
-(folders 14 and 15). The overall arc is right and worth following. These specific defects are not.
+(folders 14, 15 and 16). The overall arc is right and worth following. These specific defects are
+not.
 
-### 11.1 The adapter is never loaded
+### 13.1 The adapter is never loaded
 
 ```python
 model_path = "/content/tinyllama-lora/checkpoint-5"
@@ -404,20 +550,20 @@ working code path doesn't use it.
 **How to catch this yourself:** snapshot a weight tensor before and after and assert it changed.
 Notebook 02 does exactly that. One assertion, catches it every time.
 
-### 11.2 Training on padding
+### 13.2 Training on padding
 
 `padding="max_length"` with `labels = input_ids.copy()`. See §4.
 
-### 11.3 Supervising the prompt
+### 13.3 Supervising the prompt
 
 The instruction stage computes loss over the whole sequence. See §5.
 
-### 11.4 No EOS, no eval split, no baseline
+### 13.4 No EOS, no eval split, no baseline
 
 Targets have no EOS (§6), there is no held-out set, and no metric is captured before training —
 so there is no evidence any of it worked.
 
-### 11.5 Smaller things
+### 13.5 Smaller things
 
 - `load_in_8bit=True` then LoRA, without `prepare_model_for_kbit_training`.
 - The tokenizer is loaded from `TinyLlama-1.1B-Chat-v1.0` while the model is
@@ -425,16 +571,37 @@ so there is no evidence any of it worked.
 - Checkpoint paths hardcoded to `checkpoint-5` / `checkpoint-3`, which only exist for one
   particular step count.
 
+### 13.6 The preference stage (folder 16)
+
+Folder 16's `Preference_Aligned_Training_DPO_final.ipynb` repeats the pattern, with defects specific
+to DPO:
+
+- **Five hand-written preference pairs**, in `pharma_preference_data.csv`. Every objection in §11
+  applies: hand-authored, trivially separable, entirely off-policy. Five is also fewer than one
+  optimizer step at the notebook's own `gradient_accumulation_steps=8`.
+- **`load_in_8bit=True` immediately before `merge_and_unload()`.** The base is loaded quantized,
+  then the instruction adapter is merged into it. Merging a fp16 update into 8-bit weights is
+  exactly the operation §3 says not to perform, and it is why this repo does not quantize at all.
+- **`tokenizer.pad_token = tokenizer.eos_token`**, the aliasing §7 covers, and here it lands in a
+  stage that is already prone to unlearning EOS.
+- **No eval split and no metric.** All five pairs are used for training, `eval_dataset` is never
+  passed, and the before/after comparison is a single prompt generated with `do_sample=True,
+  temperature=0.8` — so consecutive runs of the *same* model disagree, and nothing distinguishes a
+  training effect from the sampler.
+- **`loss_type="sigmoid"` as a string**, against an unpinned `!pip install -U trl`. Since trl 0.29
+  the field is a `list[str]`.
+
 None of this makes the reference worthless — it's a useful tour of the landscape. But copying it
 verbatim gives you a pipeline that appears to work and mostly doesn't, which is worse than one
 that fails loudly.
 
 ---
 
-## 12. Choosing a dataset for two-stage fine-tuning
+## 14. Choosing a dataset for multi-stage fine-tuning
 
 The hardest practical constraint in this repo was not the code — it was finding **one authentic
-source that feeds both stages**. Stage 1 needs raw text; stage 2 needs instruction pairs. Most
+source that feeds every stage**. Stage 1 needs raw text; stage 2 needs instruction pairs; stage 3
+needs a gradable label, so that preference pairs can be mined rather than hand-written. Most
 public datasets give you one or the other, and stitching two unrelated ones together means stage 1
 adapts to a domain stage 2 never asks about.
 
@@ -491,7 +658,7 @@ decline. That failure is installed by the *absence* of data, not by anything you
 
 ---
 
-## 13. Things worth trying next
+## 15. Things worth trying next
 
 | Change | Why |
 |---|---|
@@ -503,5 +670,6 @@ decline. That failure is installed by the *absence* of data, not by anything you
 | **TRL `SFTTrainer`** | Handles packing and completion-only masking. Use it once you know what it's doing. |
 | **QLoRA** | Necessary at 7B+. Note the merge constraint in §3. |
 | **Unsloth** | ~2× faster, lower memory, for exactly this workload. |
-| **DPO / ORPO** | The stage after instruction tuning. |
+| **A $\beta$ sweep for stage 3** | The one DPO hyperparameter that changes *what* is optimised rather than how fast. See §10. |
+| **ORPO or KTO** | ORPO needs no reference model; KTO needs no pairs. Both are cheaper than DPO. See §11. |
 | **GGUF export** | `llama.cpp` conversion to run the merged model locally. |

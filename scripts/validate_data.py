@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pre-flight checks on the PubMedQA-derived data both notebooks train on.
+"""Pre-flight checks on the PubMedQA-derived data all three notebooks train on.
 
 Verifies:
   * both PubMedQA configs load and have the expected schema
@@ -7,7 +7,7 @@ Verifies:
   * the stage-2 split is stratified and every decision class appears in eval
   * the yes/no/maybe grading regex recovers the gold label on 100% of records
   * length statistics fit the notebooks' token budgets
-  * the constants duplicated in the notebooks still match this repo's scripts
+  * the constants duplicated in all three notebooks still match this repo's scripts
 
 Needs `datasets`; add `transformers` for exact token counts instead of estimates.
 
@@ -179,6 +179,14 @@ def check_notebook_constants() -> None:
             "EVAL_FRACTION": prep.EVAL_FRACTION,
             "DATASET": prep.DATASET,
         },
+        # Notebook 03 rebuilds the stage-2 split from these same constants, which is what
+        # guarantees its preference pairs are mined from the training 800 and its accuracy is
+        # scored on the same held-out 200. Drift here would break both guarantees silently.
+        "03_preference_tuning_dpo": {
+            "SEED": prep.SEED,
+            "EVAL_FRACTION": prep.EVAL_FRACTION,
+            "DATASET": prep.DATASET,
+        },
     }
     for stem, constants in expected.items():
         path = NOTEBOOKS / f"{stem}.ipynb"
@@ -203,7 +211,7 @@ def check_notebook_constants() -> None:
             if got != want:
                 fail(f"{path.name}: {name} is {got!r}, prepare_data.py says {want!r}")
                 clean = False
-        if stem.startswith("02") and 'Begin your reply with "Answer:"' not in src:
+        if stem.startswith(("02", "03")) and 'Begin your reply with "Answer:"' not in src:
             fail(f"{path.name}: TASK string differs from prepare_data.py")
             clean = False
         if clean:
