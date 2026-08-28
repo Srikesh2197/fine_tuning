@@ -8,6 +8,11 @@ instrumented so you can tell whether the training actually did anything.
 Everything comes from one real, public dataset:
 **[`qiaojin/PubMedQA`](https://huggingface.co/datasets/qiaojin/PubMedQA)** (MIT licence).
 
+A fourth notebook comes after the pipeline and is the part most fine-tuning walkthroughs skip:
+**serving**. It exports a merged checkpoint, puts it behind `vllm serve`, proves the served model
+still answers the same, and measures what it costs per token. That one needs an A100 or L4 — see
+[Notebook 05](#notebook-05--serving-with-vllm) below.
+
 ```
 unsloth/Llama-3.2-1B  (base — no instruction tuning)
       │
@@ -46,12 +51,15 @@ produce one.
 2. Run it top to bottom (~12 min). It saves a LoRA adapter to your Google Drive.
 3. Open notebook 02 and run it top to bottom (~12 min). It picks the adapter up from Drive.
 4. Open notebook 03 and run it top to bottom (~35 min). It needs **both** earlier adapters.
+5. Optional, and **not free-tier**: notebook 05 (serving, ~55 min) needs an **A100 or L4**. It
+   needs all three adapters, merges them into one checkpoint, and serves it.
 
 | | |
 |---|---|
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/01_domain_adaptation_lora.ipynb) | **01 - Domain adaptation** (non-instructional, LoRA) |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/02_instruction_finetuning_lora.ipynb) | **02 - Instruction tuning** (LoRA on the merged stage-1 model) |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/03_preference_tuning_dpo.ipynb) | **03 - Preference tuning** (DPO on self-generated pairs) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/05_serving_vllm.ipynb) | **05 - Serving** (merged export, `vllm serve`, benchmarks) — **A100/L4, not T4** |
 
 > Badges open the notebooks from `main`. The repo is private, so the first time you use
 > one, Colab will ask to authorise GitHub access — tick **Include private repos**.
@@ -72,13 +80,14 @@ notebooks/
   01_domain_adaptation_lora.ipynb      non-instructional fine-tuning, baseline → train → measure
   02_instruction_finetuning_lora.ipynb merge stage 1, instruction-tune, score against baselines
   03_preference_tuning_dpo.ipynb       merge stages 1+2, mine preference pairs, DPO, re-score
+  05_serving_vllm.ipynb                merge and export, vllm serve, correctness gate, benchmarks
 scripts/
   prepare_data.py                      materialise the prepared data locally (no GPU needed)
   validate_data.py                     schema, disjointness, stratification, token budgets
 data/
   README.md                            dataset provenance, splits, licence, honest caveats
 docs/
-  concepts.md                          the why: LoRA math, masking, DPO, evaluation, common bugs
+  concepts.md                          the why: LoRA math, masking, DPO, evaluation, serving, bugs
 ```
 
 Nothing is committed under `data/` — the notebooks load from the Hub at runtime.
@@ -96,6 +105,7 @@ from different PubMed articles:
 | 01 — domain adaptation | `pqa_unlabeled` (61,249) | 1,000 abstracts, **questions discarded** — ~292k tokens of raw prose |
 | 02 — instruction tuning | `pqa_labeled` (1,000) | question + abstract → `Answer: yes/no/maybe` + expert justification |
 | 03 — preference tuning | `pqa_labeled`, the same 800 training rows | (chosen, rejected) pairs **mined from the stage-2 model's own samples**, graded against the expert label |
+| 05 — serving | `pqa_labeled`, the same 200 held-out rows | no training. The eval split is the correctness gate and the benchmark workload — real prompts with a real length distribution |
 
 Three properties make it a good teaching set:
 
@@ -187,6 +197,28 @@ Fill these in when you run it — the numbers depend on your Colab session.
 | + domain + instruct | | | |
 | + domain + instruct + dpo | | | |
 
+**Notebook 05 — serving the merged checkpoint**
+
+| Metric | `model.generate()` | `vllm serve` |
+|---|---|---|
+| Accuracy, same 200 held-out | | |
+| TTFT p50 / p95 (ms) | | |
+| Inter-token latency p50 (ms) | | |
+| Output tokens/sec, 1 request | | |
+| Output tokens/sec, peak | | |
+| ...at concurrency | | |
+| Ragged 48-request workload (s) | | |
+| Cost per 1M output tokens, GPU fully busy | | |
+
+| Serving measurement | Value |
+|---|---|
+| KV cache, predicted / reported by vLLM (tokens) | / |
+| Concurrency at the knee of the frontier | |
+| Peak decode rate as a fraction of the bandwidth roofline | |
+| Per-record agreement with `model.generate()` | |
+| Prefix caching, TTFT change (real prompts / repeated prompt) | / |
+| Runtime LoRA vs merged, ITL cost | |
+
 **Stage 3 — the preference objective itself**
 
 | Metric | Step 0 | Final |
@@ -202,6 +234,13 @@ to emit `Answer:` — and a stage-2 model that answers in the right format and s
 beats 55% on *content* is the genuinely open question at this data scale; the notebook prints a
 confusion matrix so you can see whether it's discriminating or just saying "yes".
 
+For notebook 05, expect vLLM to win on every throughput row and to win by much more under
+concurrency than at batch 1 — at one request in flight both systems are memory-bandwidth-bound and
+there is little to win. The two rows worth reading closely are **accuracy**, which must match
+`model.generate()` to within about a point, and **per-record agreement**, which will be high and
+will not be 100%: greedy decoding is not bit-reproducible across engines, so regression-test the
+metric rather than the string.
+
 For stage 3, expect the reward margin to rise and `rewards/chosen` to go **negative** — DPO widens
 the margin mostly by suppressing the rejected answer rather than promoting the chosen one. That is
 normal, and it is also why the margin alone proves nothing. The accuracy row and the McNemar
@@ -216,7 +255,8 @@ Pinned in [`requirements-colab.txt`](requirements-colab.txt), verified against P
 transformers v5 source:
 
 ```
-transformers==5.15.0    peft==0.20.0    datasets==5.0.1    accelerate==1.14.0    trl==0.29.1
+transformers==5.15.0    peft==0.20.0    datasets==5.0.1    accelerate==1.14.0
+trl==0.29.1             vllm==0.19.1
 ```
 
 `trl` is used by notebook 03 only. Its `DPOConfig` **moves several defaults** — `learning_rate` to
@@ -225,8 +265,17 @@ transformers==5.15.0    peft==0.20.0    datasets==5.0.1    accelerate==1.14.0   
 Notebook 03 sets all of them explicitly, and `requirements-colab.txt` records which layer moves
 which.
 
-`torch` is deliberately unpinned — Colab ships a CUDA-matched build and replacing it is slow and
-fragile. Colab's preinstalled `torchao` is uninstalled, because `peft`'s optional integration
+`vllm` is used by notebook 05 only, and it is the one dependency here that **replaces `torch`**:
+it ships precompiled CUDA kernels linked against a single torch ABI, so installing it repins torch
+and asks for a runtime restart. Its `transformers` specifier excludes 5.0 through 5.5.0 and allows
+everything after, so the pin above survives it — worth re-checking whenever either moves, because
+most vllm/transformers pairs in 2026 did conflict. Two of its defaults will stop the server booting
+and are covered in `requirements-colab.txt`: `max_model_len` inherits the checkpoint's
+`max_position_embeddings` (131,072 for Llama 3.2, or 4.3 GB of KV cache for one sequence), and
+`gpu_memory_utilization` is a fraction of **total** VRAM rather than free VRAM.
+
+`torch` is deliberately unpinned everywhere else — Colab ships a CUDA-matched build and replacing
+it is slow and fragile. Colab's preinstalled `torchao` is uninstalled, because `peft`'s optional integration
 raises rather than degrading when it finds a version below its minimum. A known-good fallback pin
 set is commented in the same file.
 
@@ -237,6 +286,26 @@ gate and HF token setup. Only `MODEL_ID` changes if you'd rather use the officia
 
 Note it's the **base** model, not `-Instruct`. That's the point: the whole narrative is watching
 instruction-following get installed.
+
+### Notebook 05 — serving with vLLM
+
+The pipeline's last mile, and the one most fine-tuning material skips entirely. It needs all three
+adapters from 01-03, merges them into a single self-contained checkpoint, serves that checkpoint
+with `vllm serve` over an OpenAI-compatible HTTP endpoint, and then measures it — TTFT, inter-token
+latency, p95, and throughput against concurrency — with `model.generate()` measured the same way on
+the same GPU for contrast.
+
+Two things it does that a speed comparison usually does not. It **gates on correctness first**: the
+same 200 held-out articles are re-scored through the endpoint and the accuracy must match what
+`model.generate()` gets before any timing number is read. And it **fixes the output length on both
+sides**, because a benchmark that lets one system answer in 40 tokens and the other in 120 is
+comparing verbosity rather than speed.
+
+**It does not run on a T4.** vLLM's fast attention backends need compute capability 8.0+; on Turing
+it falls back to `TRITON_ATTN`, which works but means the numbers describe the fallback rather than
+the engine. The notebook asserts sm_80+ rather than quietly producing them. `docs/concepts.md` §16
+has the reasoning — KV cache math, continuous batching, the roofline, and how to not lie with a
+benchmark.
 
 ---
 
@@ -251,6 +320,11 @@ instruction-following get installed.
 - **A 200-record accuracy difference under ~7 points is noise.** That is roughly the 95% interval
   for a proportion near 55% at n=200. Notebook 03 reports a paired McNemar test precisely so that a
   stage-3 result inside that band gets called what it is.
+- **Notebook 05 is not free-tier**, and its benchmarks are one model, one prompt shape, one GPU,
+  one engine version, on a shared and thermally-throttled Colab card. Treat a difference under ~5%
+  as noise, the same way stage 3 treats an accuracy delta under 7 points. Its load generator is
+  closed-loop, so it measures the machine honestly and the world optimistically — real traffic
+  arrives whether or not you are ready for it.
 - **Stage 3 tunes a proxy for preference, not preference.** "Chosen" means "agreed with the
   expert's yes/no/maybe". Real preference data encodes helpfulness, hedging and tone, none of which
   a regex can grade.

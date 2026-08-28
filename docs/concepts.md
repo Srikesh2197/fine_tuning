@@ -673,3 +673,222 @@ decline. That failure is installed by the *absence* of data, not by anything you
 | **A $\beta$ sweep for stage 3** | The one DPO hyperparameter that changes *what* is optimised rather than how fast. See §10. |
 | **ORPO or KTO** | ORPO needs no reference model; KTO needs no pairs. Both are cheaper than DPO. See §11. |
 | **GGUF export** | `llama.cpp` conversion to run the merged model locally. |
+| **Serving it** | Export a merged checkpoint and put it behind an HTTP endpoint. **Implemented in notebook 05** — see §16. |
+
+---
+
+## 16. Serving
+
+Everything above this section produces an adapter. This section is about the distance between an
+adapter and something a user can send a request to, which is larger than it looks and is where a
+surprising number of fine-tuning projects quietly stop. Notebook 05 implements all of it.
+
+### 16.1 An adapter is not an artifact
+
+`stage3-dpo-lora` is ~45 MB of $A$ and $B$ matrices. It is meaningless without:
+
+1. the exact base weights it was trained against,
+2. every earlier adapter, merged in, **in order**,
+3. the tokenizer, the prompt template, and the generation config.
+
+No serving engine takes an adapter as a model. vLLM, TGI and TensorRT-LLM all want a checkpoint —
+a directory with `config.json`, weights, and tokenizer files. Producing one means running the same
+`PeftModel.from_pretrained(...).merge_and_unload()` chain the notebooks use between stages, then
+`save_pretrained`. That is the whole export, and it is also where §13.1's failure mode gets its
+last chance to bite: a merge that silently did nothing produces a checkpoint that serves the base
+model perfectly happily.
+
+### 16.2 What a checkpoint has to tell a server
+
+Four fields that training never had to care about, all of which become deployment properties baked
+into the artifact by whoever exports it:
+
+| field | what goes wrong | how it fails |
+|---|---|---|
+| `max_position_embeddings` | vLLM defaults `max_model_len` to it. Llama 3.2 claims 131,072, which at 32 KiB/token is 4.3 GB of KV cache for **one** sequence. | Loudly — the server exits during startup. |
+| `torch_dtype` | Inherited from whatever the export ran in, not chosen. Ship a bf16 checkpoint to a Turing box and it is emulated. | Quietly — a performance cliff nobody attributes to a config file. |
+| `eos_token_id` | Wrong or missing means the model never stops. Every request runs to `max_tokens`. | Silently, and *consistently* — every latency and cost number becomes a measurement of the token cap. |
+| chat template | A base model has none, so `/v1/chat/completions` cannot build a prompt. | Loudly, with a 400 — and the fix is to use `/v1/completions`, not to invent a template. |
+
+The third is the dangerous one. The other three fail in ways you notice.
+
+The chat-template point is worth dwelling on, because the instinct is to add one. Notebooks 02 and
+03 trained on an explicit `### Instruction: / ### Response:` template. A chat template would have
+to reproduce that string exactly to produce a prompt the model recognises — at which point you have
+re-implemented `build_prompt` in Jinja and gained nothing. Serving a base model through
+`/v1/completions` and formatting on the client is the honest arrangement.
+
+### 16.3 The KV cache, and why GQA is a serving decision
+
+Attention needs the keys and values of every previous token. Recomputing them each step would be
+quadratic, so they are cached. The cache costs, per token:
+
+$$\text{bytes} = 2 \times n_\text{layers} \times n_\text{kv heads} \times d_\text{head} \times \text{bytes per element}$$
+
+For Llama 3.2 1B in bf16: $2 \times 16 \times 8 \times 64 \times 2 = 32{,}768$ bytes — **32 KiB per
+token**. A 1,000-token conversation costs 32 MB of GPU memory that has nothing to do with the
+weights.
+
+The `8` is grouped-query attention. The model has 32 query heads but only 8 key/value heads, four
+queries sharing each KV pair. Without GQA the same model would need 128 KiB per token — **4x** —
+and would serve a quarter as many concurrent users on the same card. GQA is usually explained as an
+architecture choice; it is at least as much a serving one.
+
+Everything not spent on weights and activations is KV cache, and KV cache is concurrency:
+
+$$\text{concurrent sequences} \approx \frac{\text{VRAM} \times \texttt{gpu\_memory\_utilization} - \text{weights} - \text{overhead}}{\text{KV bytes per token} \times \texttt{max\_model\_len}}$$
+
+Two consequences that catch people out. `gpu_memory_utilization` is a fraction of **total** VRAM,
+not free VRAM — leave a model loaded elsewhere and vLLM still takes its share, silently shrinking
+the cache. And `max_model_len` is a **concurrency** knob as much as a capability one: halving the
+context you support doubles the number of users you fit.
+
+### 16.4 PagedAttention and continuous batching
+
+Two separate ideas, usually conflated.
+
+**PagedAttention** stores the KV cache in fixed-size blocks, indexed indirectly, exactly like
+virtual memory pages. Without it you must reserve worst-case contiguous space per sequence, and the
+gap between reserved and used is pure waste. With it, sequences of wildly different lengths pack
+into the same pool, and identical prefixes can *share* blocks — which is what makes prefix caching
+close to free.
+
+**Continuous batching** is a scheduling policy. Static batching picks $N$ requests, runs them
+together, and returns when the *slowest* finishes; a request wanting 24 tokens sits in a 256-token
+batch for 232 steps computing padding. Continuous batching schedules per token: a finished sequence
+leaves at the next step and a queued one takes its slot immediately.
+
+The gap between them is entirely a function of how ragged the workload is. Benchmark with uniform
+output lengths and static batching looks fine — which is why so many comparisons pin the length and
+report a modest difference. Real traffic is ragged. Notebook 05 §14 measures both on the same 48
+requests with lengths from 24 to 256 tokens.
+
+### 16.5 Prefill and decode are different machines
+
+One request has two phases with different bottlenecks, and conflating them is the root of most
+confused performance work.
+
+| | prefill | decode |
+|---|---|---|
+| does | one forward pass over the whole prompt | one forward pass per generated token |
+| parallelism | all prompt tokens at once | one token per sequence |
+| bound by | **compute** (FLOPs) | **memory bandwidth** (weight reads) |
+| shows up as | TTFT | inter-token latency |
+| scales with | prompt length | nothing much |
+
+So: adding 500 tokens of few-shot examples to a prompt does not slow generation down at all. It
+moves TTFT, which is precisely the number the user experiences as "is this thing broken?".
+
+And batching helps decode enormously but prefill barely — decode reads all the weights to produce
+one token per sequence, so serving 32 sequences from one weight read is nearly free, while prefill
+was already saturating the GPU.
+
+### 16.6 The roofline
+
+Decoding one token at batch 1 requires reading every weight once. Nothing else is close. So:
+
+$$\text{tokens/sec} \le \frac{\text{memory bandwidth}}{\text{model size in bytes}}$$
+
+A 2.5 GB model on a 300 GB/s L4 cannot exceed ~120 tokens/sec on a single stream, no matter what
+engine you use. That number is worth computing before benchmarking anything, for two reasons: a
+measurement above it is wrong (usually the responses were shorter than you thought), and it says
+what the achievable win actually is. If you are at 80% of roofline, no engine change will help and
+**quantization is the only lever** — halve the bytes per weight and the ceiling doubles.
+
+It also explains batching in one line: the roofline is per *weight read*, and a batch of 32 gets 32
+tokens out of one read.
+
+### 16.7 Throughput, latency, and the frontier
+
+These trade against each other and cannot be summarised in one number.
+
+- **TTFT** — time to first token. What a chat UI lives on.
+- **ITL** — inter-token latency. Perceived as reading speed.
+- **End-to-end** — the whole request. What a batch job cares about.
+- **Throughput** — system output tokens/sec across all requests. What the bill is computed from.
+
+Raising concurrency raises throughput and raises latency, until throughput flattens — KV cache
+full, `max_num_seqs` reached, or GPU saturated — after which extra concurrency adds only queueing.
+Plotting **p95 latency against throughput**, one point per concurrency level, gives a frontier, and
+every point on it is a legitimate operating choice. A latency SLO is a horizontal line across that
+plot; where it crosses the curve is what one GPU is worth to you. This chart is the single most
+useful artifact of a serving benchmark and is almost never drawn.
+
+One methodological caveat: a load generator holding $N$ requests in flight is **closed-loop** and
+can never build a queue it did not intend to. Real traffic is open-loop — it arrives whether or not
+you are ready. Only a fixed-arrival-rate test shows queueing collapse.
+
+### 16.8 How to not lie with a benchmark
+
+Serving benchmarks are easy to get wrong in ways that look authoritative.
+
+- **Fix the output length.** If one system emits 40 tokens and the other 120, tokens/sec is
+  comparing verbosity. Pin it: `min_new_tokens` in transformers, `ignore_eos` in vLLM. This is the
+  most common error by a distance.
+- **Discard the warmup.** The first call pays for autotuning, memory-pool growth, CUDA graph
+  capture and compilation. Including it slanders whichever system you measured first.
+- **Do not hold two engines in memory at once.** vLLM reserves a fraction of *total* VRAM; a
+  forgotten model does not error, it just shrinks the KV cache and makes vLLM look slow.
+- **Say which throughput.** Output tokens/sec and total (prompt + output) tokens/sec differ by
+  several times on long-prompt workloads.
+- **Do not report a p99 from 50 samples.** It is the maximum, and it describes your sample rather
+  than the server. Report p50 and p95, and say $n$.
+- **Repeat.** Shared and thermally-throttled GPUs move several percent run to run. A 5% difference
+  from single runs is not a difference — the same instinct §9 applies to accuracy.
+- **State the scope.** One model, one prompt shape, one GPU, one engine version. Smaller models
+  understate the gap, because larger ones spend proportionally more time memory-bound.
+
+### 16.9 Greedy decoding is not reproducible across engines
+
+Greedy decoding is deterministic *given identical arithmetic*, and two engines do not do identical
+arithmetic. Different kernels, different batch shapes, different reduction orders in bf16 — wherever
+the top two logits are close, the argmax flips. Batch size alone changes the result, because it
+changes reduction order.
+
+So a serving migration should assert on the **metric**, not the string. Notebook 05 §11 re-scores
+the same 200 held-out records through the endpoint and checks accuracy parity, while reporting
+byte-identical agreement separately and expecting it to be below 100%. A regression test that
+compares generated text will fail on every deploy for reasons that do not matter, and will be
+switched off, and then nothing will be checking.
+
+Do this **before** any performance measurement. A faster model that answers differently is not the
+model you trained.
+
+### 16.10 Merged weights, or adapters at runtime
+
+Two ways to serve a fine-tune, with genuinely different economics:
+
+| | merged | runtime LoRA (`--enable-lora`) |
+|---|---|---|
+| artifact per fine-tune | ~2.5 GB checkpoint | ~45 MB adapter |
+| per-token cost | none | a small extra matmul |
+| tenants per GPU | one | many |
+| adding a tenant | deploy a model | copy a file |
+
+For one model at high volume, merge. For a platform hosting many customers' adapters against one
+base, runtime LoRA is not a close call — it is the difference between one GPU per customer and one
+GPU per hundred.
+
+The constraint is §3's, restated: **an adapter is only valid against the weights it was trained
+on.** In a multi-stage pipeline the last adapter was trained on the *merged* earlier stages, so
+that merged model is what must be loaded underneath it. Pointing `--enable-lora` at the original
+base loads without error and serves a model that has never existed — §13.1's failure mode wearing a
+different hat.
+
+### 16.11 What a notebook cannot show you
+
+Honest limits of notebook 05, and roughly where the real work is:
+
+- **Replicas and autoscaling.** Scale on queue depth or TTFT, not GPU utilization — a saturated GPU
+  reads as 100% busy long before latency degrades, and then all at once.
+- **Admission control.** Past the knee of the frontier, accepting more work only makes every
+  request slower. Shedding load beats serving all of it badly.
+- **Request cancellation.** A disconnected client should free its slot immediately; otherwise
+  abandoned work is paid for in full.
+- **Warmup on deploy.** The first requests pay for graph capture and compilation. Send synthetic
+  traffic before routing users.
+- **Checkpoint versioning.** Pin by digest and re-run the §16.9 accuracy gate on every deploy. The
+  served model can stop being the model you tested without anything failing.
+- **Cost is not peak throughput.** Dividing a GPU's hourly rate by its *peak* tokens/sec assumes it
+  is busy every second it is rented. Nothing is. A service sized for peak and idle overnight might
+  average 15% utilization and cost six times the headline figure.

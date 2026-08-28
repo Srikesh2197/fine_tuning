@@ -1,8 +1,11 @@
-# Pinned for Google Colab (free-tier T4). All three notebooks install from this file.
+# Pinned for Google Colab. Notebooks 01-03 run on the free-tier T4; notebook 05
+# serves the merged model and needs an A100 or L4. All four install from this file.
 #
 # torch is deliberately NOT pinned: Colab ships a CUDA-matched build, and
 # reinstalling it there is slow and frequently breaks the runtime.
 # transformers 5.x requires torch>=2.5 and Python>=3.10 — Colab satisfies both.
+# The one exception is notebook 05: vllm hard-pins an exact torch build and
+# there is no way around it. See the vllm section below.
 #
 # TRL is used by notebook 03 ONLY, for DPOTrainer. Notebooks 01 and 02 stay on
 # plain transformers.Trainer + peft so the masking and packing remain visible on
@@ -10,12 +13,18 @@
 # max_seq_length API churn. The DPO loss is a different case: subtle, easy to get
 # quietly wrong, and TRL's is the reference implementation. See docs/concepts.md
 # section 10.
+#
+# vllm is used by notebook 05 ONLY, which serves the merged checkpoint over HTTP
+# and benchmarks it against model.generate(). It is the heaviest dependency here
+# by a distance and the only one that replaces torch. See docs/concepts.md
+# section 16.
 
 transformers==5.15.0
 peft==0.20.0
 datasets==5.0.1
 accelerate==1.14.0
 trl==0.29.1
+vllm==0.19.1
 
 # --- What DPOConfig changes out from under you ------------------------------
 # Read out of trl 0.29.1's source, not recalled. DPOConfig inherits from
@@ -53,6 +62,42 @@ trl==0.29.1
 # reads the padding side of the tokenizer you hand it as `processing_class`.
 # Notebook 03 still left-pads, for its own batched generation.
 
+# --- What vllm changes out from under you, notebook 05 only -----------------
+# Read out of vllm 0.19.1's package metadata, not recalled.
+#
+#   torch                   HARD PINNED to one exact version. vllm ships
+#                           precompiled CUDA kernels linked against a single
+#                           torch ABI, so installing it REPLACES Colab's build.
+#                           Budget several minutes and a runtime restart. This
+#                           is the opposite of the rule notebooks 01-03 follow,
+#                           and the reason is that there is no choice.
+#   transformers            specifier excludes 5.0 through 5.5.0 and allows
+#                           everything after, so the 5.15.0 above is fine and
+#                           nothing gets downgraded. Re-check this whenever
+#                           either pin moves — most vllm/transformers pairs in
+#                           2026 did conflict.
+#   torchao                 NOT a vllm dependency, so the uninstall below stays
+#                           safe in notebook 05 too.
+#   aiohttp, openai         both arrive with vllm, so notebook 05's async load
+#                           generator and its OpenAI-client demo need no extra
+#                           install.
+#
+# Hardware: vllm's fast attention backends (FlashAttention, FlashInfer) require
+# compute capability 8.0+. On a Turing T4 it falls back to TRITON_ATTN, which
+# works but is not what anyone means by "vLLM throughput". Notebook 05 asserts
+# sm_80+ rather than quietly producing fallback numbers.
+#
+# Two config fields decide whether the server starts at all, and neither is a
+# training concern — notebook 05 section 4 covers both:
+#
+#   max_model_len           defaults to the checkpoint's max_position_embeddings,
+#                           which for Llama 3.2 is 131,072. At 32 KiB of KV cache
+#                           per token that is 4.3 GB for ONE sequence, and the
+#                           server exits during startup. Pass --max-model-len.
+#   gpu_memory_utilization  is a fraction of TOTAL VRAM, not of free VRAM. Leave
+#                           a model loaded in the same process and vllm still
+#                           takes its share, silently shrinking the KV cache.
+
 # --- Fallback pin set -------------------------------------------------------
 # If the pins above ever conflict with Colab's preinstalled torch, this older
 # combination is known-good. You must then swap `dtype=` for `torch_dtype=` in
@@ -67,6 +112,6 @@ trl==0.29.1
 # Colab ships torchao 0.10.x. peft's optional torchao integration RAISES an
 # ImportError rather than degrading when it finds a version below its 0.16.0
 # minimum, and the check fires inside get_peft_model(). Nothing in this repo
-# uses torchao, so all three notebooks uninstall it:
+# uses torchao, so all four notebooks uninstall it:
 #
 #     %pip uninstall -q -y torchao

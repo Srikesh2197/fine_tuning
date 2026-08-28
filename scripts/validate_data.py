@@ -187,6 +187,14 @@ def check_notebook_constants() -> None:
             "EVAL_FRACTION": prep.EVAL_FRACTION,
             "DATASET": prep.DATASET,
         },
+        # Notebook 05 serves the merged model and re-scores the SAME held-out 200 records through
+        # the HTTP endpoint, asserting the served accuracy matches what model.generate() gets. That
+        # gate is only a gate while the split and the prompt are identical to notebooks 02 and 03.
+        "05_serving_vllm": {
+            "SEED": prep.SEED,
+            "EVAL_FRACTION": prep.EVAL_FRACTION,
+            "DATASET": prep.DATASET,
+        },
     }
     for stem, constants in expected.items():
         path = NOTEBOOKS / f"{stem}.ipynb"
@@ -211,7 +219,7 @@ def check_notebook_constants() -> None:
             if got != want:
                 fail(f"{path.name}: {name} is {got!r}, prepare_data.py says {want!r}")
                 clean = False
-        if stem.startswith(("02", "03")) and 'Begin your reply with "Answer:"' not in src:
+        if stem.startswith(("02", "03", "05")) and 'Begin your reply with "Answer:"' not in src:
             fail(f"{path.name}: TASK string differs from prepare_data.py")
             clean = False
         if clean:
