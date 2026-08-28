@@ -102,6 +102,14 @@ projections.
 
 If domain adaptation underdelivers, check `target_modules` before touching `r`.
 
+> **These are claims, and this repo now tests them.** The three assertions in this section — that
+> `target_modules` matters more than `r`, that `alpha = 2r` decouples capacity from step size, and
+> that rank 64+ is rarely justified on a small corpus — are received wisdom, defensible but not
+> measured. `notebooks/03a_lora_ablation.ipynb` runs each one as an arm and reports the result
+> against the run-to-run noise of this setup. Read the numbers there before trusting the table
+> above; on 800 training examples several of these effects turn out to be smaller than the
+> measurement error, which is itself worth knowing.
+
 ### Why adapters rather than full fine-tuning
 
 Practical, not ideological:
@@ -666,7 +674,7 @@ decline. That failure is installed by the *absence* of data, not by anything you
 | **More abstracts in stage 1** | `N_ABSTRACTS` is 1,000 out of 61,249 available. Raise it until the Colab session is the limit. |
 | **Article-level split in stage 1** | Measures generalisation to unseen papers rather than in-domain fit. |
 | **A classification head** | For yes/no/maybe alone, `AutoModelForSequenceClassification` beats generation and is far cheaper to score. |
-| **`r` and `target_modules` sweep** | Both notebooks are set up so this is a one-line change. |
+| ~~**`r` and `target_modules` sweep**~~ | Done — `notebooks/03a_lora_ablation.ipynb` sweeps both, plus `alpha/r` and the learning rate, against a measured noise floor. |
 | **TRL `SFTTrainer`** | Handles packing and completion-only masking. Use it once you know what it's doing. |
 | **QLoRA** | Necessary at 7B+. Note the merge constraint in §3. |
 | **Unsloth** | ~2× faster, lower memory, for exactly this workload. |

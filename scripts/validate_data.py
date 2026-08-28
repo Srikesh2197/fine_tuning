@@ -187,6 +187,15 @@ def check_notebook_constants() -> None:
             "EVAL_FRACTION": prep.EVAL_FRACTION,
             "DATASET": prep.DATASET,
         },
+        # Notebook 03a sweeps notebook 02's LoRA configuration. Its baseline arm is only
+        # comparable to notebook 02's result if it rebuilds the identical 800/200 split, so the
+        # same three constants have to hold. (The TASK check below catches it too: "03a"
+        # startswith "03".)
+        "03a_lora_ablation": {
+            "SEED": prep.SEED,
+            "EVAL_FRACTION": prep.EVAL_FRACTION,
+            "DATASET": prep.DATASET,
+        },
     }
     for stem, constants in expected.items():
         path = NOTEBOOKS / f"{stem}.ipynb"

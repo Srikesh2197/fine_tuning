@@ -47,11 +47,17 @@ produce one.
 3. Open notebook 02 and run it top to bottom (~12 min). It picks the adapter up from Drive.
 4. Open notebook 03 and run it top to bottom (~35 min). It needs **both** earlier adapters.
 
+Notebook **03a** is optional and off the pipeline — it re-trains stage 2 sixteen times to
+measure what the LoRA knobs actually do, and produces no adapter. It needs the stage-1
+adapter and about **90 minutes on an A100** (~2.5 h on a T4; it has a `QUICK` toggle that
+runs the whole thing in 6 minutes first, and it checkpoints after every arm).
+
 | | |
 |---|---|
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/01_domain_adaptation_lora.ipynb) | **01 - Domain adaptation** (non-instructional, LoRA) |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/02_instruction_finetuning_lora.ipynb) | **02 - Instruction tuning** (LoRA on the merged stage-1 model) |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/03_preference_tuning_dpo.ipynb) | **03 - Preference tuning** (DPO on self-generated pairs) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Srikesh2197/fine_tuning/blob/main/notebooks/03a_lora_ablation.ipynb) | **03a - LoRA ablation** (16-arm sweep of stage 2's config) |
 
 > Badges open the notebooks from `main`. The repo is private, so the first time you use
 > one, Colab will ask to authorise GitHub access — tick **Include private repos**.
@@ -72,6 +78,7 @@ notebooks/
   01_domain_adaptation_lora.ipynb      non-instructional fine-tuning, baseline → train → measure
   02_instruction_finetuning_lora.ipynb merge stage 1, instruction-tune, score against baselines
   03_preference_tuning_dpo.ipynb       merge stages 1+2, mine preference pairs, DPO, re-score
+  03a_lora_ablation.ipynb              sweep stage 2's r / alpha / targets / lr, with a noise floor
 scripts/
   prepare_data.py                      materialise the prepared data locally (no GPU needed)
   validate_data.py                     schema, disjointness, stratification, token budgets
@@ -195,6 +202,18 @@ Fill these in when you run it — the numbers depend on your Colab session.
 | `rewards/chosen` | 0.0000 | |
 | Preference accuracy, held-out pairs | | |
 | McNemar p, stage 3 vs stage 2 | n/a | |
+
+**03a — LoRA ablation** (16 arms; every delta is against the `baseline` arm, not notebook 02)
+
+| Measurement | Value |
+|---|---|
+| Measured noise floor (max \|Δaccuracy\| over 4 same-config seed pairs) | |
+| `baseline` accuracy (notebook 02's config, retrained here) | |
+| Best arm, and its Δ vs `baseline` | |
+| Arms clearing the noise floor, out of 15 | |
+| Did the winners survive replication at a new seed? | |
+| Best learning rate at r=8 / r=16 / r=64 | |
+| Accuracy range across a 13x span of trainable parameters | |
 
 What to expect: a clear perplexity drop in stage 1 (biomedical text has real headroom for a 1B
 general model), near-zero parse rates for the two untuned systems — neither has ever been taught
